@@ -1,0 +1,51 @@
+{
+  "targets": 3,
+  "verdicts": {
+    "broken": 2,
+    "ok": 1
+  },
+  "methods": {
+    "none": 1,
+    "rss": 1,
+    "listing": 1
+  },
+  "findings": {
+    "unreachable": 1,
+    "last_resort": 1,
+    "article_unfetchable": 1
+  },
+  "median_overlap": 1.0,
+  "zero_yield": 0,
+  "unreachable": 1,
+  "pct_clean": 33.3,
+  "by_tld": {
+    ".com": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".org": {
+      "targets": 1,
+      "ok": 1,
+      "workable": 1,
+      "pct_workable": 100.0
+    },
+    ".fi": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    }
+  },
+  "extraction": {
+    "probed": 2,
+    "article_fetched": 1,
+    "pct_fetched": 50.0,
+    "got_headline": 1,
+    "got_body": 1,
+    "got_date": 1,
+    "usable": 1,
+    "pct_usable_of_probed": 50.0
+  }
+}

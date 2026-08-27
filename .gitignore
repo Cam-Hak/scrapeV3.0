@@ -1,0 +1,56 @@
+# --- secrets -----------------------------------------------------------
+# v1 committed configs/db_config.yml (DB root password) and v2 committed
+# configs/my_mail.py (SMTP password). Both are still in those repos' history.
+# These rules are deliberately broad: it is much cheaper to un-ignore one
+# file than to scrub a credential out of git history.
+.env
+.env.*
+!.env.example
+*secret*
+*credential*
+*password*
+key
+keys/
+*.pem
+*.key
+!ops/webbotauth/*.pub
+
+# --- config that tends to hold hosts/users -----------------------------
+*_config.yml
+*_config.yaml
+db_config.*
+my_mail.*
+
+# --- python ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# --- runtime data ------------------------------------------------------
+# The derived site lists (data/sites.*, data/survey_sample.txt) ARE inputs and
+# should be versioned. Only crawl output and survey runs are ignored.
+logs/
+data/surveys/
+data/articles/
+*.sqlite
+*.db
+*.jsonl
+
+# --- database dumps ----------------------------------------------------
+# dbs/ holds restores of the live tns schema: 34k agency rows carrying editor
+# usernames and per-agency instructions, plus 21 MB of data that has no
+# business in git. The schema they define is documented in the README instead.
+dbs/
+*.dmp.sql
+
+# --- os / editor -------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

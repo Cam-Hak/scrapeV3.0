@@ -1,0 +1,1315 @@
+"""Command-line entry point."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from rich import box
+from rich.console import Console
+from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
+from rich.table import Table
+
+from .settings import Settings
+from .survey import read_sites, run_survey, summarize
+
+console = Console()
+
+
+def _configure_event_loop() -> None:
+    """Windows: use the selector loop rather than the default proactor loop.
+
+    curl_cffi (and aiodns/c-ares later) need `add_reader`/`add_writer`, which
+    ProactorEventLoop does not implement - it otherwise spawns an extra
+    selector thread as a workaround. The selector loop caps at 512 file
+    descriptors, which is far above our global concurrency of ~32.
+
+    This makes Windows usable, but production should still run under WSL2:
+    the 512-FD ceiling is a real limit if concurrency ever grows.
+    """
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
+def _configure_console() -> None:
+    """Force UTF-8 on the Windows console.
+
+    The default codepage is cp1252, which cannot encode the characters rich
+    uses for table borders and for its truncation ellipsis - so a table that
+    overflows the terminal renders cells as replacement characters and looks
+    like corrupted data rather than a narrow window.
+    """
+    if sys.platform == "win32":
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(encoding="utf-8")
+            except Exception:                               # noqa: BLE001
+                pass                                        # not a real console
+
+
+def _cmd_survey(args: argparse.Namespace) -> int:
+    settings = Settings.load()
+    sites_path = Path(args.sites)
+    if not sites_path.is_file():
+        console.print(f"[red]No such file:[/red] {sites_path}")
+        return 2
+
+    sites = read_sites(sites_path)
+    if args.limit:
+        sites = sites[: args.limit]
+    if not sites:
+        console.print("[red]No usable URLs found in that file.[/red]")
+        return 2
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    out = Path(args.out) if args.out else settings.data_dir / "surveys" / f"survey-{stamp}.jsonl"
+
+    console.print(f"Surveying [bold]{len(sites)}[/bold] domains -> [dim]{out}[/dim]")
+    console.print(
+        f"[dim]Identity: {settings.identity.user_agent}[/dim]\n"
+        f"[dim]Politeness: {settings.politeness.default_delay_s}s/host, "
+        f"concurrency {settings.politeness.max_concurrency_per_host}/host, "
+        f"{args.concurrency} hosts in parallel[/dim]\n"
+    )
+
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("probing", total=len(sites))
+
+        def tick(result) -> None:
+            progress.advance(task)
+            progress.update(task, description=f"probing [dim]{result.domain[:40]}[/dim]")
+
+        results = asyncio.run(
+            run_survey(sites, out, settings, concurrency=args.concurrency, progress=tick)
+        )
+
+    summary = summarize(results)
+    summary_path = out.with_suffix(".summary.json")
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    _print_summary(summary)
+    console.print(f"\nRows:    [dim]{out}[/dim]")
+    console.print(f"Summary: [dim]{summary_path}[/dim]")
+    return 0
+
+
+def _print_summary(s: dict) -> None:
+    n = s["domains_sampled"]
+    console.print(f"\n[bold]Survey of {n} domains[/bold]\n")
+
+    reach = Table(title="Reachability", show_header=True, header_style="bold")
+    reach.add_column("Metric")
+    reach.add_column("%", justify="right")
+    reach.add_row("Reachable (HTTP 200)", f"{s['reachable']}")
+    reach.add_row("Bot walls (Cloudflare etc.)", f"{s['cloudflare_walls']}")
+    reach.add_row("robots.txt disallows us", f"{s['robots_disallow']}")
+    console.print(reach)
+
+    disc = Table(title="Discovery cascade - which mechanism wins", header_style="bold")
+    disc.add_column("Mechanism")
+    disc.add_column("%", justify="right")
+    for label, key in (
+        ("Google News sitemap", "news_sitemap"),
+        ("Any sitemap", "any_sitemap"),
+        ("RSS via autodiscovery", "rss_autodiscovered"),
+        ("RSS via path probe", "rss_via_probe"),
+        ("  ...with full content:encoded", "rss_full_content"),
+        ("CMS JSON API", "cms_api"),
+        ("Listing page only (fallback)", "listing_only"),
+    ):
+        disc.add_row(label, f"{s['discovery'][key]}")
+    console.print(disc)
+
+    sd = s["structured_data"]
+    tested = sd["article_pages_tested"]
+    sdt = Table(title=f"Structured data (on {tested} real article pages)", header_style="bold")
+    sdt.add_column("Field")
+    sdt.add_column("%", justify="right")
+    sdt.add_row("JSON-LD Article/NewsArticle/BlogPosting", f"{sd['jsonld_article_type']}")
+    sdt.add_row("  headline", f"{sd['has_headline']}")
+    sdt.add_row("  datePublished", f"{sd['has_datepublished']}")
+    sdt.add_row("  articleBody", f"{sd['has_articlebody']}")
+    console.print(sdt)
+
+    js = s["js_escalation"]
+    jst = Table(title="JS escalation - the cost driver", header_style="bold")
+    jst.add_column("Metric")
+    jst.add_column("Value", justify="right")
+    jst.add_row("Needs a browser", f"{js['needs_browser']}%")
+    jst.add_row("Has hydration payload (mineable, no browser)", f"{js['has_hydration_payload']}%")
+    jst.add_row("Median text chars from plain HTTP", f"{js['median_text_chars']}")
+    console.print(jst)
+
+    ip = s["shared_ip"]
+    console.print(
+        f"\n[bold]Shared IPs:[/bold] {ip['distinct_ips']} distinct addresses, "
+        f"{ip['domains_on_shared_ip']}% of domains share one, "
+        f"largest cluster {ip['largest_cluster']}."
+    )
+    if ip["largest_cluster"] >= 5:
+        console.print(
+            "[yellow]  -> Meaningful concentration. Consider pacing per IP as well as "
+            "per domain (Nutch queues on (host, IP) for this reason).[/yellow]"
+        )
+
+    wp = s["wordpress"]
+    console.print(
+        f"[bold]WordPress:[/bold] {wp['detected']}% of domains; "
+        f"of those, {wp['wp_json_reachable']}% expose a usable /wp-json REST API."
+    )
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """Check that the local environment can actually run this."""
+    console.print("[bold]scrapev3 environment check[/bold]\n")
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Check")
+    table.add_column("Status")
+    table.add_column("Detail", overflow="fold")
+
+    ok = True
+
+    table.add_row("Python", "[green]ok[/green]", sys.version.split()[0])
+
+    for mod, why in (
+        ("curl_cffi", "TLS/JA4-correct HTTP client"),
+        ("selectolax", "fast DOM parsing"),
+        ("trafilatura", "body extraction"),
+        ("htmldate", "date extraction"),
+        ("protego", "robots.txt"),
+        ("tldextract", "eTLD+1"),
+    ):
+        try:
+            __import__(mod)
+            table.add_row(mod, "[green]ok[/green]", why)
+        except ImportError:
+            ok = False
+            table.add_row(mod, "[red]missing[/red]", f"{why} - pip install {mod}")
+
+    settings = Settings.load()
+
+    # Only needed for the tns sink, so missing is a warning until it is asked for.
+    for mod, why in (("pymysql", "MySQL driver"),
+                     ("unidecode", "latin1-safe text for press_release")):
+        try:
+            __import__(mod)
+            table.add_row(mod, "[green]ok[/green]", f"{why} (tns sink)")
+        except ImportError:
+            if settings.tns_sink_enabled:
+                ok = False
+            table.add_row(mod, "[red]missing[/red]" if settings.tns_sink_enabled
+                          else "[dim]not installed[/dim]",
+                          f"{why} - pip install -e .[sink]")
+
+    ua = settings.identity.user_agent
+    if "bot" in ua.lower() and "+http" in ua:
+        table.add_row("User-Agent", "[green]ok[/green]", ua)
+    else:
+        ok = False
+        table.add_row("User-Agent", "[yellow]weak[/yellow]",
+                      f"{ua} - needs the token 'bot' and a +https:// contact URL")
+
+    # MySQL. Only needed for the tns.press_release sink, so a missing server is
+    # informational unless SCRAPEV3_SINK actually asks for it.
+    required = settings.tns_sink_enabled
+    if not settings.mysql.configured:
+        table.add_row("MySQL", "[red]not configured[/red]" if required else "[dim]not configured[/dim]",
+                      "Set SCRAPEV3_MYSQL_HOST in .env for the tns sink")
+        ok = ok and not required
+    else:
+        detail, status = _check_mysql(settings)
+        if status != "ok":
+            ok = ok and not required
+        table.add_row("MySQL", f"[green]ok[/green]" if status == "ok"
+                      else f"[{'red' if required else 'yellow'}]{status}[/]", detail)
+
+    # Ollama is only needed from Phase 5; absence is informational, not fatal.
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"{settings.ollama.host}/api/tags", timeout=2) as r:
+            tags = json.loads(r.read())
+        models = [m.get("name", "?") for m in tags.get("models", [])]
+        hit = settings.ollama.model in models
+        table.add_row(
+            "Ollama",
+            "[green]ok[/green]" if hit else "[yellow]model missing[/yellow]",
+            f"{len(models)} model(s). Want '{settings.ollama.model}'"
+            + ("" if hit else f" - run: ollama pull {settings.ollama.model}"),
+        )
+    except Exception:
+        table.add_row("Ollama", "[dim]not running[/dim]",
+                      "Only needed from Phase 5 (wrapper induction)")
+
+    console.print(table)
+    return 0 if ok else 1
+
+
+def _check_mysql(settings: Settings) -> tuple[str, str]:
+    """(detail, status) for the doctor table."""
+    from .tns import connect
+
+    try:
+        conn = connect(settings, settings.mysql.sink_db)
+    except Exception as exc:                                # noqa: BLE001
+        return f"{settings.mysql.host}:{settings.mysql.port} - {exc}", "unreachable"
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT VERSION()")
+            version = cur.fetchone()[0]
+            cur.execute("SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = %s", (settings.mysql.sink_db,))
+            tables = {r[0] for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+    # All three matter: press_release is the target, and without agencies and
+    # url_grp there is no filename prefix, no lede and no owner.
+    missing = sorted({"press_release", "agencies", "url_grp"} - tables)
+    if missing:
+        return (f"MySQL {version} - {settings.mysql.sink_db} is missing "
+                f"{', '.join(missing)}"), "incomplete"
+    return f"MySQL {version} - {settings.mysql.sink_db}.press_release ready", "ok"
+
+
+def _cmd_frontier_seed(args: argparse.Namespace) -> int:
+    """Load the target list into the frontier."""
+    import csv
+
+    from .frontier import open_frontier
+    from .urls import canonical_url, registrable_domain
+
+    Settings.load()
+    path = Path(args.sites)
+    if not path.is_file():
+        console.print(f"[red]No such file:[/red] {path}")
+        return 2
+
+    rows: list[tuple[int, str, str]] = []
+    with path.open(encoding="utf-8-sig", newline="") as fh:
+        reader = csv.DictReader(fh)
+        if reader.fieldnames and "newsroom_url" in reader.fieldnames:
+            for r in reader:
+                url = canonical_url(r["newsroom_url"])
+                dom = r.get("domain") or registrable_domain(url)
+                if url and dom:
+                    rows.append((int(r.get("a_id") or 0), url, dom))
+        else:
+            fh.seek(0)
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                url = canonical_url(line.split(",")[0])
+                dom = registrable_domain(url)
+                if url and dom:
+                    rows.append((0, url, dom))
+
+    store = open_frontier()
+    try:
+        n = store.upsert_sites(rows)
+        stats = store.stats()
+    finally:
+        store.close()
+
+    console.print(f"Seeded [bold]{n}[/bold] targets ({len({d for _, _, d in rows})} distinct domains)")
+    _print_frontier_stats(stats)
+    return 0
+
+
+def _print_frontier_stats(s) -> None:
+    table = Table(title="Frontier", header_style="bold")
+    table.add_column("Metric")
+    table.add_column("Count", justify="right")
+    table.add_row("Domains (lease/pacing unit)", f"{s.total:,}")
+    table.add_row("Newsroom URLs (crawl unit)", f"{s.targets:,}")
+    table.add_row("Domains enabled", f"{s.enabled:,}")
+    table.add_row("Due now", f"{s.due:,}")
+    table.add_row("Currently leased", f"{s.leased:,}")
+    table.add_row("Failing (consec > 0)", f"{s.failing:,}")
+    table.add_row("Never crawled", f"{s.never_crawled:,}")
+    table.add_row("Flagged needs-browser", f"{s.needs_browser:,}")
+    console.print(table)
+
+
+def _cmd_frontier_stats(args: argparse.Namespace) -> int:
+    from .frontier import open_frontier
+
+    Settings.load()
+    store = open_frontier()
+    try:
+        reclaimed = store.release_expired_leases()
+        stats = store.stats()
+        scheduled = store.schedule_enabled
+    finally:
+        store.close()
+    if reclaimed:
+        console.print(f"[yellow]Reclaimed {reclaimed} expired lease(s).[/yellow]")
+    _print_frontier_stats(stats)
+    if not scheduled:
+        console.print(
+            "[dim]Schedule off (SCRAPEV3_SCHEDULE=off): every enabled domain is due, "
+            "and crawling one leaves it due. Lease and per-host pacing unaffected.[/dim]")
+    return 0
+
+
+def _cmd_crawl(args: argparse.Namespace) -> int:
+    """Lease domains, discover articles, extract, and store them."""
+    from .crawl import crawl_once
+    from .frontier import open_frontier
+    from .sink import Sink
+
+    settings = Settings.load()
+    frontier = open_frontier()
+    sink = Sink(settings.data_dir)
+
+    # A named scope means "this site, now", not "whatever is due". Resolved
+    # here so an unknown a_id fails immediately instead of silently crawling
+    # nothing and looking like an extraction failure.
+    only_domains = None
+    if args.a_id is not None:
+        only_domains = frontier.domains_for(a_id=args.a_id)
+        if not only_domains:
+            console.print(f"[red]No frontier target for a_id {args.a_id}.[/red] "
+                          "[dim]Is it in data/sites.csv? Try: scrapev3 seed[/dim]")
+            frontier.close()
+            sink.close()
+            return 2
+    elif args.domain:
+        only_domains = [args.domain]
+
+    if args.refetch:
+        if only_domains is None:
+            console.print("[red]--refetch needs a scope[/red] "
+                          "[dim](--a-id or --domain), or use: scrapev3 reset --yes[/dim]")
+            frontier.close()
+            sink.close()
+            return 2
+        # Without this the dedup check short-circuits before the fetch and the
+        # re-crawl stores nothing at all.
+        forgotten = sink.forget(domain=args.domain, a_id=args.a_id)
+        frontier.make_due(domain=args.domain, a_id=args.a_id)
+        console.print(f"[dim]--refetch: forgot {forgotten:,} stored article(s); "
+                      "they will be fetched again[/dim]")
+
+    # --sink overrides SCRAPEV3_SINK for this run. Opening the TNS sink up
+    # front is deliberate: a bad password or a missing agencies table should
+    # stop the run before it has politely spent ten minutes crawling.
+    want_tns = args.sink == "tns" if args.sink else settings.tns_sink_enabled
+    tns = None
+    if want_tns:
+        from .tns import open_tns_sink
+        try:
+            tns = open_tns_sink(settings, dry_run=args.dry_run)
+        except Exception as exc:                            # noqa: BLE001
+            console.print(f"[red]Cannot open the tns sink:[/red] {exc}")
+            frontier.close()
+            sink.close()
+            return 2
+
+    console.print(
+        f"Crawling up to [bold]{args.domains}[/bold] domains, "
+        f"max {args.max_articles} articles each, "
+        f"window {args.max_age_days}d\n"
+        f"[dim]{settings.identity.user_agent} | "
+        f"{settings.politeness.default_delay_s}s/host, 1 concurrent/host, "
+        f"{settings.politeness.max_concurrency_per_ip} concurrent/IP[/dim]"
+    )
+    if tns is not None:
+        console.print(
+            f"[dim]Sink: {settings.mysql.sink_db}.press_release on "
+            f"{settings.mysql.host} | {len(tns.agencies):,} agencies loaded"
+            + (" | DRY RUN, nothing will be written[/dim]" if args.dry_run else "[/dim]"))
+    else:
+        console.print("[dim]Sink: JSONL only (--sink tns to load press_release)[/dim]")
+    console.print()
+
+    try:
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(
+                "crawling", total=len(only_domains) if only_domains else args.domains)
+
+            def tick(domain: str) -> None:
+                progress.advance(task)
+                progress.update(task, description=f"crawling [dim]{domain[:38]}[/dim]")
+
+            stats = asyncio.run(crawl_once(
+                settings=settings, frontier=frontier, sink=sink, tns=tns,
+                domains=args.domains, only_domains=only_domains,
+                only_a_id=args.a_id, max_articles=args.max_articles,
+                max_age_days=args.max_age_days, concurrency=args.concurrency,
+                progress=tick,
+            ))
+        out_path = sink.path
+        sink_stats = sink.stats()
+    finally:
+        sink.close()
+        frontier.close()
+        if tns is not None:
+            tns.close()
+
+    table = Table(title="Crawl result", header_style="bold")
+    table.add_column("Metric")
+    table.add_column("Count", justify="right")
+    for label, value in (
+        ("Domains leased", stats.domains),
+        ("Newsroom URLs crawled", stats.targets),
+        ("Articles discovered", stats.discovered),
+        ("  already seen (skipped before fetch)", stats.already_seen),
+        ("  pages fetched", stats.fetched),
+        ("  [green]stored[/green]", stats.stored),
+        ("  unusable (short/no date)", stats.unusable),
+        ("  off-domain (wrong publisher)", stats.off_domain),
+        ("  non-news (events/staff/courses)", stats.non_news),
+        ("  needed a browser", stats.needs_browser),
+        ("  body text dupes", stats.body_text_dupes),
+        ("  failed", stats.failed),
+    ):
+        table.add_row(label, f"{value:,}")
+    console.print(table)
+
+    if stats.by_method:
+        m = Table(title="Discovery method used", header_style="bold")
+        m.add_column("Method")
+        m.add_column("Domains", justify="right")
+        for k, v in sorted(stats.by_method.items(), key=lambda kv: -kv[1]):
+            m.add_row(k, str(v))
+        console.print(m)
+
+    if stats.by_body_source:
+        b = Table(title="Where the body came from", header_style="bold")
+        b.add_column("Source")
+        b.add_column("Articles", justify="right")
+        for k, v in sorted(stats.by_body_source.items(), key=lambda kv: -kv[1]):
+            b.add_row(k, str(v))
+        console.print(b)
+
+    if tns is not None:
+        _print_tns_stats(tns.stats)
+        if stats.tns_failed:
+            console.print(
+                f"[yellow]{stats.tns_failed} article(s) failed to load and are marked "
+                "retryable. Re-run: scrapev3 tns backfill[/yellow]")
+
+    if stats.errors:
+        console.print(f"\n[yellow]{len(stats.errors)} error(s), first few:[/yellow]")
+        for err in stats.errors[:8]:
+            console.print(f"  [dim]{err[:110]}[/dim]")
+
+    console.print(
+        f"\nTotal stored to date: [bold]{sink_stats['articles']:,}[/bold] articles "
+        f"across {sink_stats['domains']:,} domains"
+    )
+    console.print(f"Output: [dim]{out_path}[/dim]")
+    console.print("[dim]Inspect with: scrapev3 show[/dim]")
+    return 0
+
+
+def _cmd_show(args: argparse.Namespace) -> int:
+    """Print recently scraped articles so results are inspectable."""
+    settings = Settings.load()
+    files = sorted((settings.data_dir / "articles").glob("articles-*.jsonl"))
+    if not files:
+        console.print("[yellow]No articles yet.[/yellow] Run: scrapev3 crawl")
+        return 1
+
+    records = []
+    for path in files:
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    records.append(json.loads(line))
+                except Exception:
+                    continue
+    if args.domain:
+        records = [r for r in records if args.domain in (r.get("domain") or "")]
+    records = records[-args.limit:]
+
+    if not records:
+        console.print("[yellow]Nothing matched.[/yellow]")
+        return 1
+
+    if args.full:
+        for r in records:
+            console.print(f"\n[bold cyan]{r.get('headline') or '(no headline)'}[/bold cyan]")
+            console.print(
+                f"[dim]{r.get('domain')} | {r.get('published_at') or 'no date'} "
+                f"(via {r.get('date_source')}) | body via {r.get('body_source')} "
+                f"| {len(r.get('body') or '')} chars[/dim]")
+            console.print(f"[dim]{r.get('url')}[/dim]")
+            body = (r.get("body") or "")[: args.chars]
+            console.print(body + ("..." if len(r.get("body") or "") > args.chars else ""))
+            if r.get("warnings"):
+                console.print(f"[yellow]warnings: {', '.join(r['warnings'])}[/yellow]")
+    else:
+        t = Table(header_style="bold", show_lines=False)
+        t.add_column("Date", width=10)
+        t.add_column("Domain", width=22, overflow="ellipsis")
+        t.add_column("Headline", overflow="ellipsis")
+        t.add_column("Body", justify="right", width=7)
+        t.add_column("Via", width=12)
+        for r in records:
+            date = (r.get("published_at") or "")[:10] or "-"
+            t.add_row(date, r.get("domain") or "-", r.get("headline") or "(none)",
+                      f"{len(r.get('body') or ''):,}", r.get("body_source") or "-")
+        console.print(t)
+
+    console.print(f"\n[dim]{len(records)} shown. Files: {settings.data_dir / 'articles'}[/dim]")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# tns - the MySQL output contract
+# ---------------------------------------------------------------------------
+
+def _frontier_a_ids() -> list[int]:
+    """Every agency id the frontier will actually crawl."""
+    from .frontier import open_frontier
+
+    store = open_frontier()
+    try:
+        return store.agency_ids()
+    finally:
+        store.close()
+
+
+def _load_audit(path: Path) -> list:
+    """Rebuild audits from a saved run and re-apply the current scoring.
+
+    Each row stores the measurements, not just the conclusion, so a change to
+    the rules can be tested against every target already audited without
+    spending a single request.
+    """
+    from .audit import TargetAudit, judge
+
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        d = json.loads(line)
+        d.pop("findings", None)
+        d.pop("score", None)
+        d.pop("verdict", None)
+        a = TargetAudit(**d)
+        judge(a)
+        out.append(a)
+    return out
+
+
+def _cmd_audit_rescore(args: argparse.Namespace) -> int:
+    from .audit import summarize
+
+    path = Path(args.rescore)
+    if not path.is_file():
+        console.print(f"[red]No such file:[/red] {path}")
+        return 2
+    results = _load_audit(path)
+    if not results:
+        console.print("[yellow]That file has no rows.[/yellow]")
+        return 1
+    console.print(f"Re-scored [bold]{len(results)}[/bold] target(s) from "
+                  f"[dim]{path}[/dim] with the current rules\n")
+    _print_audit(results, summarize(results), path)
+    return 0
+
+
+_VERDICT_STYLE = {"broken": "red", "suspicious": "yellow", "check": "cyan", "ok": "green"}
+
+
+def _cmd_audit(args: argparse.Namespace) -> int:
+    """Run discovery across many targets and rank what looks wrong.
+
+    Read-only: no article pages are fetched, nothing is written to the dedup
+    index or to MySQL. It costs the newsroom page plus whatever the cascade
+    spends, at the usual per-host pacing.
+    """
+    import random
+
+    from .audit import audit_target, summarize
+    from .fetch import PoliteFetcher
+    from .frontier import open_frontier
+
+    if args.rescore:
+        return _cmd_audit_rescore(args)
+
+    settings = Settings.load()
+    store = open_frontier()
+    try:
+        if args.a_id is not None:
+            rows = [(t.a_id, t.domain, t.newsroom_url, t.discovery_method,
+                     t.feed_url, t.feed_absent)
+                    for d in store.domains_for(a_id=args.a_id)
+                    for t in store.targets_for(d) if t.a_id == args.a_id]
+        elif args.domain:
+            rows = [(t.a_id, t.domain, t.newsroom_url, t.discovery_method,
+                     t.feed_url, t.feed_absent)
+                    for t in store.targets_for(args.domain)]
+        else:
+            raw = store._execute(
+                "SELECT a_id, domain, newsroom_url, discovery_method, feed_url, "
+                "feed_absent FROM target WHERE enabled = 1")
+            rows = [(int(r[0]), r[1], r[2], r[3], r[4], bool(r[5])) for r in raw]
+            # One target per domain: auditing 417 house.gov pages tells you the
+            # same thing 417 times and spends 417 requests on one origin.
+            by_domain = {}
+            for r in rows:
+                by_domain.setdefault(r[1], r)
+            rows = list(by_domain.values())
+            random.seed(args.seed)
+            random.shuffle(rows)
+            rows = rows[: args.limit]
+    finally:
+        store.close()
+
+    if not rows:
+        console.print("[red]No targets matched.[/red] Have you run: scrapev3 seed ?")
+        return 2
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    out = Path(args.out) if args.out else settings.data_dir / "audits" / f"audit-{stamp}.jsonl"
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # A full-corpus run is hours long. Resuming matters more than tidiness:
+    # losing three hours to a dropped connection is how a measurement stops
+    # getting taken.
+    if args.resume and out.is_file():
+        done = {json.loads(l)["domain"]
+                for l in out.read_text(encoding="utf-8").splitlines() if l.strip()}
+        rows = [r for r in rows if r[1] not in done]
+        console.print(f"[dim]Resuming: {len(done):,} already audited, "
+                      f"{len(rows):,} to go[/dim]")
+        if not rows:
+            console.print("[green]Nothing left to audit.[/green] Re-score with: "
+                          f"scrapev3 audit --rescore {out}")
+            return 0
+
+    console.print(
+        f"Auditing discovery on [bold]{len(rows)}[/bold] target(s) -> [dim]{out}[/dim]")
+    console.print(
+        f"[dim]No article pages fetched. Nothing written to the index or MySQL. "
+        f"{settings.politeness.default_delay_s}s/host, "
+        f"{args.concurrency} targets in parallel[/dim]\n")
+
+    async def run():
+        sem = asyncio.Semaphore(args.concurrency)
+        results = []
+        with out.open("a" if args.resume else "w", encoding="utf-8") as fh, Progress(
+            TextColumn("[progress.description]{task.description}"), BarColumn(),
+            TextColumn("{task.completed}/{task.total}"), TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("auditing", total=len(rows))
+
+            async with PoliteFetcher(settings) as fetcher:
+                async def one(row):
+                    a_id, domain, url, method, feed, absent = row
+                    async with sem:
+                        try:
+                            r = await audit_target(
+                                fetcher, a_id=a_id, domain=domain, newsroom_url=url,
+                                known_method=method, known_feed=feed,
+                                feed_absent=bool(absent), limit=args.articles,
+                                extract=args.extract)
+                        except Exception as exc:            # noqa: BLE001
+                            progress.advance(task)
+                            console.print(
+                                f"[red]{domain}: {type(exc).__name__}: {exc}[/red]")
+                            return
+                        results.append(r)
+                        # Flushed per row, so an interrupted audit is still usable.
+                        fh.write(json.dumps(r.as_dict(), ensure_ascii=False) + "\n")
+                        fh.flush()
+                        progress.advance(task)
+                        progress.update(
+                            task, description=f"auditing [dim]{domain[:34]}[/dim]")
+
+                await asyncio.gather(*(one(r) for r in rows))
+        return results
+
+    results = asyncio.run(run())
+    if not results:
+        console.print("[red]Nothing completed.[/red]")
+        return 1
+
+    summary = summarize(results)
+    out.with_suffix(".summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8")
+    _print_audit(results, summary, out)
+    return 0
+
+
+def _audit_tail(results) -> int:
+    """Show every broken/suspicious target, but cap the tail so a bad run does
+    not bury the summary above it."""
+    bad = sum(1 for r in results if r.verdict in ("broken", "suspicious"))
+    return max(min(bad, 25), 10)
+
+
+def _print_audit(results, summary: dict, out: Path) -> None:
+    v = Table(title="Verdict", header_style="bold", box=box.SIMPLE)
+    v.add_column("Verdict")
+    v.add_column("Targets", justify="right")
+    v.add_column("Meaning", overflow="fold")
+    for name, meaning in (
+        ("broken", "nothing found, wrong publisher, or nothing matching the page"),
+        ("suspicious", "results do not look like this section's articles"),
+        ("check", "worked, but on a weaker footing than you would like"),
+        ("ok", "no flags raised"),
+    ):
+        n = summary["verdicts"].get(name, 0)
+        if n:
+            v.add_row(f"[{_VERDICT_STYLE[name]}]{name}[/]", f"{n:,}", meaning)
+    console.print(v)
+
+    m = Table(title="Which source won", header_style="bold", box=box.SIMPLE)
+    m.add_column("Method")
+    m.add_column("Targets", justify="right")
+    for k, n in sorted(summary["methods"].items(), key=lambda kv: -kv[1]):
+        m.add_row(str(k), f"{n:,}")
+    console.print(m)
+
+    if summary["findings"]:
+        f = Table(title="Flags raised", header_style="bold", box=box.SIMPLE)
+        f.add_column("Flag")
+        f.add_column("Targets", justify="right")
+        for k, n in sorted(summary["findings"].items(), key=lambda kv: -kv[1]):
+            f.add_row(k, f"{n:,}")
+        console.print(f)
+
+    ov = summary["median_overlap"]
+    if ov is not None:
+        console.print(f"\n[bold]Median overlap with the newsroom page:[/bold] {ov:.0%}")
+    console.print(f"[bold]Clean:[/bold] {summary['pct_clean']}% of targets raised no flag")
+
+    ex = summary.get("extraction") or {}
+    if ex.get("probed"):
+        e = Table(title="End to end - one article fetched per domain",
+                  header_style="bold", box=box.SIMPLE)
+        e.add_column("Stage")
+        e.add_column("Domains", justify="right")
+        e.add_column("% of probed", justify="right")
+        pr = ex["probed"]
+        for label, key in (("article fetched", "article_fetched"),
+                           ("  got a headline", "got_headline"),
+                           ("  got a body (300+ chars)", "got_body"),
+                           ("  got a date", "got_date"),
+                           ("  [green]usable article[/green]", "usable")):
+            v = ex.get(key, 0)
+            e.add_row(label, f"{v:,}", f"{100 * v / pr:.1f}%")
+        console.print(e)
+
+    tlds = summary.get("by_tld") or {}
+    if len(tlds) > 1:
+        t2 = Table(title="By TLD", header_style="bold", box=box.SIMPLE)
+        t2.add_column("TLD")
+        t2.add_column("Domains", justify="right")
+        t2.add_column("Workable", justify="right")
+        t2.add_column("% workable", justify="right")
+        for tld, b in list(tlds.items())[:10]:
+            t2.add_row(tld, f"{b['targets']:,}", f"{b['workable']:,}", f"{b['pct_workable']}%")
+        console.print(t2)
+
+    worst = sorted((r for r in results if r.findings),
+                   key=lambda r: (-r.score, r.domain))[: _audit_tail(results)]
+    if worst:
+        console.print("\n[bold]Worst first - start here[/bold]")
+        for r in worst:
+            style = _VERDICT_STYLE[r.verdict]
+            console.print(
+                f"\n  [{style}]{r.verdict.upper():<10}[/] [bold]{r.domain}[/bold] "
+                f"[dim]a_id {r.a_id} | via {r.method} | {r.n_articles} result(s)[/dim]")
+            console.print(f"  [dim]{r.newsroom_url}[/dim]")
+            for fi in r.findings:
+                console.print(f"    [{style}]-[/] {fi.detail}")
+            for u in r.sample[:2]:
+                console.print(f"    [dim]e.g. {u[:94]}[/dim]")
+
+    console.print(f"\nRows:    [dim]{out}[/dim]")
+    console.print(f"Summary: [dim]{out.with_suffix('.summary.json')}[/dim]")
+    console.print("[dim]Drill into one with: scrapev3 audit --domain <domain>[/dim]")
+
+
+def _cmd_tns_status(args: argparse.Namespace) -> int:
+    """What the sink would write, and what it can't."""
+    from .tns import AgencyDirectory, connect
+
+    settings = Settings.load()
+    if not settings.mysql.configured:
+        console.print("[red]No MySQL host configured.[/red] Set SCRAPEV3_MYSQL_HOST in .env")
+        return 2
+
+    conn = connect(settings, settings.mysql.sink_db)
+    db = settings.mysql.sink_db
+    try:
+        directory = AgencyDirectory.load(conn, db=db,
+                                         group_filter=settings.tns.group_filter)
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {db}.press_release")
+            total = cur.fetchone()[0]
+            cur.execute(f"SELECT status, COUNT(*) FROM {db}.press_release "
+                        "GROUP BY status ORDER BY 2 DESC")
+            by_status = cur.fetchall()
+            cur.execute(f"SELECT COUNT(*) FROM {db}.press_release "
+                        "WHERE create_date >= CURDATE()")
+            today = cur.fetchone()[0]
+    finally:
+        conn.close()
+
+    t = Table(title=f"{db}.press_release", header_style="bold")
+    t.add_column("Metric")
+    t.add_column("Count", justify="right")
+    t.add_row("Rows", f"{total:,}")
+    t.add_row("Loaded today", f"{today:,}")
+    for status, n in by_status:
+        t.add_row(f"  status {status or '(null)'}", f"{n:,}")
+    console.print(t)
+
+    coverage = directory.coverage(_frontier_a_ids())
+    c = Table(title="Agency directory coverage", header_style="bold")
+    c.add_column("Metric")
+    c.add_column("Count", justify="right")
+    c.add_row("Agencies in directory", f"{len(directory):,}")
+    c.add_row("Frontier target agency ids", f"{coverage['targets']:,}")
+    c.add_row("  [green]resolvable[/green]", f"{coverage['known']:,}")
+    c.add_row("  [yellow]missing from agencies[/yellow]", f"{coverage['missing']:,}")
+    c.add_row("  no prefix or lede", f"{coverage['unusable']:,}")
+    c.add_row("  no owner (uname null or -1)", f"{coverage['no_uname']:,}")
+    console.print(c)
+    if coverage["missing"]:
+        console.print(
+            f"[yellow]{coverage['missing']} agency id(s) in the frontier have no row in "
+            f"{db}.agencies - their articles are scraped but cannot be loaded.[/yellow]\n"
+            f"[dim]First few: {coverage['missing_ids']}[/dim]")
+
+    from .sink import Sink
+    sink = Sink(settings.data_dir)
+    try:
+        local = sink.stats()
+    finally:
+        sink.close()
+    s = Table(title="Local articles by load state", header_style="bold")
+    s.add_column("State")
+    s.add_column("Articles", justify="right")
+    for state, n in sorted(local["tns"].items(), key=lambda kv: -kv[1]):
+        s.add_row(state, f"{n:,}")
+    console.print(s)
+    return 0
+
+
+def _jsonl_records(settings: Settings) -> dict[str, dict]:
+    """Every article ever written, keyed by URL. The JSONL is the archive; the
+    SQLite index only holds metadata, so a backfill needs the body from here."""
+    records: dict[str, dict] = {}
+    for path in sorted((settings.data_dir / "articles").glob("articles-*.jsonl")):
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except Exception:                           # noqa: BLE001
+                    continue
+                if rec.get("url"):
+                    records[rec["url"]] = rec
+    return records
+
+
+def _cmd_tns_backfill(args: argparse.Namespace) -> int:
+    """Load articles that were scraped but never made it into press_release.
+
+    This is the reason the dedup index carries a load state at all. Without it,
+    an article stored while MySQL was down would be marked seen and never
+    offered again - v2's fail-closed dedup, which silently dropped articles on
+    any database hiccup.
+    """
+    from .sink import Sink
+    from .tns import open_tns_sink
+
+    settings = Settings.load()
+    sink = Sink(settings.data_dir)
+
+    if args.resync:
+        # The index is a cache of what press_release contains. A TRUNCATE or a
+        # restore from a dump invalidates it, and without this the articles are
+        # marked loaded against rows that no longer exist.
+        from .tns import open_tns_sink as _open
+        probe = _open(settings, dry_run=True)
+        try:
+            loaded = sink.loaded_tns()
+            gone = set(probe.missing_filenames([f for _u, f in loaded]))
+        finally:
+            probe.close()
+        stale = [u for u, f in loaded if f in gone]
+        if stale:
+            sink.reset_tns(stale)
+            console.print(f"[yellow]Resync:[/yellow] {len(stale)} article(s) were marked "
+                          f"loaded but are no longer in {settings.mysql.sink_db}"
+                          ".press_release. They will be offered again.")
+        else:
+            console.print(f"[dim]Resync: all {len(loaded)} loaded article(s) are still "
+                          "present in press_release.[/dim]")
+
+    pending = sink.pending_tns(limit=args.limit)
+    if not pending:
+        console.print("[green]Nothing pending.[/green] Every stored article has a load state.")
+        sink.close()
+        return 0
+
+    console.print(f"Backfilling [bold]{len(pending)}[/bold] article(s)"
+                  + (" [yellow](dry run - no writes)[/yellow]" if args.dry_run else ""))
+    records = _jsonl_records(settings)
+    tns = open_tns_sink(settings, dry_run=args.dry_run)
+    missing_body = 0
+    try:
+        for url, _domain, a_id in pending:
+            rec = records.get(url)
+            if not rec or not rec.get("body") or not rec.get("published_at"):
+                missing_body += 1
+                continue
+            outcome = tns.load(
+                a_id=int(rec.get("a_id") or a_id or 0),
+                headline=rec.get("headline") or "",
+                body=rec["body"],
+                published=datetime.fromisoformat(rec["published_at"]),
+                url=url,
+            )
+            if args.dry_run:
+                continue
+            if outcome == "inserted":
+                sink.mark_tns(url, "loaded", tns.last_filename)
+            elif outcome == "insert_error":
+                sink.mark_tns(url, "error")
+            else:
+                sink.mark_tns(url, f"rejected:{outcome}")
+    finally:
+        tns.close()
+        sink.close()
+
+    _print_tns_stats(tns.stats)
+    if missing_body:
+        console.print(f"[yellow]{missing_body} pending article(s) had no body in the "
+                      "JSONL archive and were left pending.[/yellow]")
+    if args.dry_run and tns.pending:
+        console.print("\n[bold]First composed row:[/bold]")
+        _print_press_release(tns.pending[0])
+    return 0
+
+
+def _cmd_tns_show(args: argparse.Namespace) -> int:
+    """Print rows straight from press_release, so the contract is inspectable."""
+    from .tns import connect
+
+    settings = Settings.load()
+    db = settings.mysql.sink_db
+    conn = connect(settings, db)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT pr_id, a_id, content_date, status, uname, location, "
+                f"filename, headline, headline2, body_txt FROM {db}.press_release "
+                "ORDER BY pr_id DESC LIMIT %s", (args.limit,))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        console.print("[yellow]press_release is empty.[/yellow] Run: scrapev3 crawl --sink tns")
+        return 1
+
+    if args.full:
+        for r in rows:
+            console.print(f"\n[bold cyan]{r[7]}[/bold cyan]")
+            console.print(f"[dim]pr_id {r[0]} | a_id {r[1]} | {r[2]} | status {r[3]} "
+                          f"| {r[4]} | {r[5] or 'no location'}[/dim]")
+            console.print(f"[dim]{r[6]}[/dim]")
+            if r[8]:
+                console.print(f"[yellow]headline2: {r[8]}[/yellow]")
+            body = r[9] or ""
+            console.print(body[: args.chars] + ("..." if len(body) > args.chars else ""))
+    else:
+        # Sized for an 80-column terminal. Body length lives in --full; the
+        # filename already carries the headline tail, so the compact view
+        # spends its width on what identifies a row.
+        # SIMPLE box: full borders cost 21 columns of an 80-column terminal,
+        # enough that rich starts squeezing the fixed-width columns to nothing.
+        t = Table(header_style="bold", box=box.SIMPLE)
+        # min_width, not width: when the table exceeds the terminal, rich
+        # shrinks fixed-width columns too, and an id squeezed to nothing is
+        # worse than a truncated headline.
+        t.add_column("pr_id", justify="right", min_width=5, no_wrap=True)
+        t.add_column("a_id", justify="right", min_width=6, no_wrap=True)
+        t.add_column("Date", min_width=10, no_wrap=True)
+        t.add_column("St", min_width=2, no_wrap=True)
+        t.add_column("Filename", min_width=20, max_width=30,
+                     overflow="ellipsis", no_wrap=True)
+        t.add_column("Headline", min_width=12, overflow="ellipsis", no_wrap=True)
+        for r in rows:
+            t.add_row(str(r[0]), str(r[1]), str(r[2]), r[3] or "-",
+                      r[6] or "-", r[7] or "-")
+        console.print(t)
+    console.print(f"\n[dim]{len(rows)} row(s) from {db}.press_release[/dim]")
+    return 0
+
+
+def _cmd_reset(args: argparse.Namespace) -> int:
+    """Undo a test run so the same sites can be crawled again.
+
+    Three stores have to move together, which is the whole reason this command
+    exists. Truncating `press_release` on its own leaves the dedup index still
+    remembering every URL - and that check runs before the fetch, so the next
+    run stores nothing and looks broken. The frontier meanwhile will not offer
+    the domain again until its revisit period elapses.
+    """
+    from .frontier import open_frontier
+    from .sink import Sink
+
+    settings = Settings.load()
+    scope = (f"domain {args.domain}" if args.domain
+             else f"a_id {args.a_id}" if args.a_id is not None
+             else "EVERYTHING")
+
+    if not (args.domain or args.a_id is not None) and not args.yes:
+        console.print("[red]Refusing to reset everything without --yes.[/red]\n"
+                      "[dim]Scope it with --domain or --a-id, or pass --yes.[/dim]")
+        return 2
+
+    sink = Sink(settings.data_dir)
+    frontier = open_frontier()
+    tns = None
+    try:
+        # Resolve everything BEFORE deleting anything. Three separate stores
+        # cannot share a transaction, so the only protection against a
+        # half-applied reset is to do all the work that can fail - opening a
+        # MySQL connection, resolving a scope - while nothing has moved yet.
+        a_ids: list[int] | None = None
+        if args.tns:
+            from .tns import open_tns_sink
+
+            if args.a_id is not None:
+                a_ids = [args.a_id]
+            elif args.domain:
+                # `None` means every row, so it is only ever passed when the
+                # user asked for that and confirmed - never as the residue of a
+                # scope that resolved to nothing.
+                a_ids = sorted({t.a_id for t in frontier.targets_for(args.domain)})
+                if not a_ids:
+                    console.print(f"[yellow]No frontier target for {args.domain}, so no "
+                                  "press_release rows could be identified.[/yellow]")
+            tns = open_tns_sink(settings)
+
+        forgotten = sink.forget(domain=args.domain, a_id=args.a_id)
+        due = frontier.make_due(domain=args.domain, a_id=args.a_id)
+        # Kept by default. Re-deriving where a site's articles come from costs
+        # a cold cascade - nine feed probes and a sitemap index walk, all at
+        # the per-host delay - to arrive at the answer already on file. The
+        # usual reason to reset is to re-check the OUTPUT, not the discovery,
+        # so --relearn asks for that explicitly.
+        relearn = (frontier.forget_discovery(domain=args.domain, a_id=args.a_id)
+                   if args.relearn else 0)
+        deleted = tns.delete_rows(a_ids) if tns is not None else None
+    finally:
+        sink.close()
+        frontier.close()
+        if tns is not None:
+            tns.close()
+
+    console.print(f"Reset [bold]{scope}[/bold]")
+    console.print(f"  {forgotten:,} article(s) forgotten - they will be fetched again")
+    console.print(f"  {due:,} domain(s) due now")
+    if relearn:
+        console.print(f"  {relearn:,} target(s) will re-run the full discovery cascade")
+    else:
+        console.print("[dim]  cached discovery source kept (--relearn to re-derive it)[/dim]")
+    if deleted is not None:
+        console.print(f"  {deleted:,} row(s) deleted from "
+                      f"{settings.mysql.sink_db}.press_release")
+    elif args.domain or args.a_id is not None:
+        console.print("[dim]  press_release untouched (--tns to clear it too)[/dim]")
+    console.print("\n[dim]The JSONL archive is append-only and was left alone.[/dim]")
+    return 0
+
+
+def _print_press_release(row) -> None:
+    console.print(f"[dim]filename:[/dim] {row.filename}")
+    console.print(f"[dim]a_id {row.a_id} | {row.content_date} | status {row.status} "
+                  f"| uname {row.uname} | location {row.location} "
+                  f"| {row.word_count} words[/dim]")
+    console.print(f"[bold cyan]{row.headline}[/bold cyan]")
+    if row.headline2:
+        console.print(f"[yellow]headline2: {row.headline2}[/yellow]")
+    console.print(row.body_txt[:1200] + ("..." if len(row.body_txt) > 1200 else ""))
+
+
+def _print_tns_stats(stats) -> None:
+    t = Table(title="tns.press_release", header_style="bold")
+    t.add_column("Outcome")
+    t.add_column("Articles", justify="right")
+    labels = {
+        "inserted": "[green]inserted[/green]",
+        "widened": "  of those, filename widened past a collision",
+        "short_doc": "  of those, status W (short doc, needs review)",
+        "no_uname": "  of those, no owner (uname null or -1)",
+        "duplicate": "already loaded",
+        "no_agency": "no agency row (a_id not in tns.agencies)",
+        "no_lede": "agency has no lede template",
+        "no_headline": "no headline",
+        "too_short": "under the word floor",
+        "too_long": "body exceeds the TEXT column",
+        "insert_error": "[red]insert failed (retryable)[/red]",
+    }
+    for key, label in labels.items():
+        value = getattr(stats, key, 0)
+        if value:
+            t.add_row(label, f"{value:,}")
+    console.print(t)
+    if stats.errors:
+        console.print(f"[yellow]{len(stats.errors)} note(s), first few:[/yellow]")
+        for err in stats.errors[:8]:
+            console.print(f"  [dim]{err[:120]}[/dim]")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="scrapev3",
+        description="Layout-agnostic news and press-release scraper.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_survey = sub.add_parser(
+        "survey",
+        help="Phase 1: measure discovery/extraction coverage across a sample of sites.",
+    )
+    p_survey.add_argument("sites", help="File of newsroom URLs (.txt one-per-line, or .csv)")
+    p_survey.add_argument("--limit", type=int, default=None, help="Only probe the first N domains")
+    p_survey.add_argument("--out", default=None, help="Output JSONL path")
+    p_survey.add_argument("--concurrency", type=int, default=16,
+                          help="Domains probed in parallel (per-host concurrency is always 1)")
+    p_survey.set_defaults(func=_cmd_survey)
+
+    p_doctor = sub.add_parser("doctor", help="Check the local environment.")
+    p_doctor.set_defaults(func=_cmd_doctor)
+
+    p_seed = sub.add_parser("seed", help="Load the target list into the frontier.")
+    p_seed.add_argument("sites", nargs="?", default="data/sites.csv",
+                        help="sites.csv (a_id,newsroom_url,domain) or a plain URL list")
+    p_seed.set_defaults(func=_cmd_frontier_seed)
+
+    p_fstats = sub.add_parser("frontier", help="Show frontier state.")
+    p_fstats.set_defaults(func=_cmd_frontier_stats)
+
+    p_crawl = sub.add_parser("crawl", help="Crawl due domains and store articles.")
+    p_crawl.add_argument("--domains", type=int, default=10, help="Domains to lease this pass")
+    p_crawl.add_argument("--max-articles", type=int, default=10, help="Max articles per newsroom URL")
+    p_crawl.add_argument("--max-age-days", type=int, default=30, help="Ignore articles older than this")
+    p_crawl.add_argument("--concurrency", type=int, default=8, help="Domains crawled in parallel")
+    crawl_scope = p_crawl.add_mutually_exclusive_group()
+    crawl_scope.add_argument("--a-id", type=int, default=None,
+                             help="Crawl only this agency, ignoring the due queue")
+    crawl_scope.add_argument("--domain", default=None,
+                             help="Crawl only this registrable domain, ignoring the due queue")
+    p_crawl.add_argument("--refetch", action="store_true",
+                         help="With --a-id/--domain: forget stored articles first so "
+                              "they are fetched again instead of skipped as seen")
+    p_crawl.add_argument("--sink", choices=["jsonl", "tns"], default=None,
+                         help="Override SCRAPEV3_SINK. 'tns' also loads tns.press_release")
+    p_crawl.add_argument("--dry-run", action="store_true",
+                         help="With --sink tns: compose the rows but write nothing to MySQL")
+    p_crawl.set_defaults(func=_cmd_crawl)
+
+    p_reset = sub.add_parser(
+        "reset", help="Undo a test run: forget articles and make domains due again.")
+    scope = p_reset.add_mutually_exclusive_group()
+    scope.add_argument("--domain", default=None, help="Only this registrable domain")
+    scope.add_argument("--a-id", type=int, default=None, help="Only this agency id")
+    p_reset.add_argument("--tns", action="store_true",
+                         help="Also delete the matching rows from press_release")
+    p_reset.add_argument("--relearn", action="store_true",
+                         help="Also forget where the articles come from, forcing a "
+                              "cold discovery cascade on the next crawl (slow)")
+    p_reset.add_argument("--yes", action="store_true",
+                         help="Required to reset every domain at once")
+    p_reset.set_defaults(func=_cmd_reset)
+
+    p_audit = sub.add_parser(
+        "audit", help="Run discovery across targets and rank what looks wrong.")
+    audit_scope = p_audit.add_mutually_exclusive_group()
+    audit_scope.add_argument("--a-id", type=int, default=None, help="Audit one agency")
+    audit_scope.add_argument("--domain", default=None, help="Audit one domain")
+    p_audit.add_argument("--limit", type=int, default=50,
+                         help="Domains to sample when no scope is given")
+    p_audit.add_argument("--articles", type=int, default=25,
+                         help="Results to ask discovery for per target")
+    p_audit.add_argument("--concurrency", type=int, default=8,
+                         help="Targets audited in parallel (per-host pacing unchanged)")
+    p_audit.add_argument("--seed", type=int, default=20260827,
+                         help="Sampling seed, so a run is repeatable")
+    p_audit.add_argument("--out", default=None, help="Output JSONL path")
+    p_audit.add_argument("--extract", action="store_true",
+                         help="Also fetch ONE article per domain and report whether it "
+                              "extracts - turns the audit into an end-to-end measure "
+                              "for one extra request per domain")
+    p_audit.add_argument("--resume", action="store_true",
+                         help="Skip domains already in --out and append. Essential "
+                              "for a full-corpus run")
+    p_audit.add_argument("--rescore", default=None, metavar="FILE",
+                         help="Re-apply the current scoring to a saved audit "
+                              "JSONL, without fetching anything")
+    p_audit.set_defaults(func=_cmd_audit)
+
+    p_tns = sub.add_parser("tns", help="The tns.press_release output contract.")
+    tns_sub = p_tns.add_subparsers(dest="tns_command", required=True)
+
+    p_tns_status = tns_sub.add_parser(
+        "status", help="Row counts, agency coverage, and what is waiting to load.")
+    p_tns_status.set_defaults(func=_cmd_tns_status)
+
+    p_tns_backfill = tns_sub.add_parser(
+        "backfill", help="Load stored articles that never reached press_release.")
+    p_tns_backfill.add_argument("--limit", type=int, default=None,
+                                help="Only attempt the first N pending articles")
+    p_tns_backfill.add_argument("--dry-run", action="store_true",
+                                help="Compose the rows and report, but write nothing")
+    p_tns_backfill.add_argument("--resync", action="store_true",
+                                help="First re-check articles marked loaded against "
+                                     "press_release, and re-offer any whose row is gone "
+                                     "(after a TRUNCATE or a restore)")
+    p_tns_backfill.set_defaults(func=_cmd_tns_backfill)
+
+    p_tns_show = tns_sub.add_parser("show", help="Print recent press_release rows.")
+    p_tns_show.add_argument("--limit", type=int, default=20)
+    p_tns_show.add_argument("--full", action="store_true", help="Print body_txt too")
+    p_tns_show.add_argument("--chars", type=int, default=1200)
+    p_tns_show.set_defaults(func=_cmd_tns_show)
+
+    p_show = sub.add_parser("show", help="Inspect scraped articles.")
+    p_show.add_argument("--limit", type=int, default=20)
+    p_show.add_argument("--domain", default=None, help="Filter by domain substring")
+    p_show.add_argument("--full", action="store_true", help="Print body text, not just a table")
+    p_show.add_argument("--chars", type=int, default=600, help="Body chars to print with --full")
+    p_show.set_defaults(func=_cmd_show)
+
+    args = parser.parse_args(argv)
+    _configure_console()
+    _configure_event_loop()
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted.[/yellow] Partial results were flushed to disk.")
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

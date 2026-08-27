@@ -1,0 +1,379 @@
+"""The crawl loop: lease a domain, discover, extract, store, release.
+
+One pass over the frontier. For each leased domain the worker crawls every
+target on it *under that single lease*, so the 417 house.gov legislator pages
+are paced as the one origin they actually are.
+
+Ordering inside a target is deliberate and matches the cheapest-first rule:
+
+    discover -> dedup check -> fetch -> extract -> store
+
+The dedup check sits BEFORE the article fetch. That is the one piece of v2's
+design worth preserving verbatim: checking first means an already-seen article
+costs nothing, and on a daily re-crawl most articles are already seen.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
+
+from .discover.sources import ArticleRef, discover
+from .extract import extract_article
+from .extract.models import Article
+from .extract.models import Path as ArticlePath
+from .fetch import PoliteFetcher
+from .frontier import Frontier, open_frontier
+from .urls import canonical_url, classify_url, is_non_news_path, registrable_domain
+from .settings import Settings
+from .sink import Sink
+
+if TYPE_CHECKING:            # the TNS sink is optional; importing it is not
+    from .tns import TnsSink
+
+
+@dataclass
+class CrawlStats:
+    domains: int = 0
+    targets: int = 0
+    discovered: int = 0
+    already_seen: int = 0
+    fetched: int = 0
+    stored: int = 0
+    body_text_dupes: int = 0
+    failed: int = 0
+    needs_browser: int = 0
+    unusable: int = 0
+    off_domain: int = 0
+    non_news: int = 0
+    tns_loaded: int = 0
+    tns_rejected: int = 0
+    tns_failed: int = 0
+    by_method: dict[str, int] = field(default_factory=dict)
+    by_body_source: dict[str, int] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+
+    def bump(self, bucket: dict[str, int], key: str) -> None:
+        bucket[key] = bucket.get(key, 0) + 1
+
+
+async def crawl_target(
+    fetcher: PoliteFetcher,
+    sink: Sink,
+    *,
+    domain: str,
+    a_id: int,
+    newsroom_url: str,
+    known_feed: str | None,
+    known_method: str | None,
+    feed_absent: bool,
+    max_articles: int,
+    max_age_days: int,
+    stats: CrawlStats,
+    tns: "TnsSink | None" = None,
+) -> tuple[str, str | None, bool]:
+    """Crawl one newsroom URL. Returns (method, source_url, feed_absent)."""
+    found = await discover(fetcher, newsroom_url,
+                           known_feed=known_feed, known_method=known_method,
+                           feed_absent=feed_absent, limit=max_articles * 3)
+    stats.bump(stats.by_method, found.method)
+    stats.discovered += len(found.articles)
+    for err in found.errors:
+        stats.errors.append(f"{domain}: {err}")
+
+    # Prefer articles under the target's own section. edisonohio.edu's target
+    # is /News, but its site-wide feed also carries /about/edison-foundation/*
+    # static pages. Scoping to the section is more principled than blocklisting
+    # section names, and it falls back to everything if nothing matches.
+    found.articles = _prefer_section(found.articles, newsroom_url)
+
+    cutoff = datetime.utcnow() - timedelta(days=max_age_days)
+    stored_here = 0
+    stale_streak = 0
+    seed = canonical_url(newsroom_url)
+
+    for ref in found.articles:
+        if stored_here >= max_articles:
+            break
+
+        # Never store the listing page itself. Sitemaps list section indexes
+        # alongside articles, and battelle.org's own newsroom URL was stored
+        # with the site's nav text as its body before this guard existed.
+        if canonical_url(ref.url) == seed:
+            continue
+
+        # Only this publisher's own content. Plenty of organisations run
+        # press-clipping feeds: ufw.org's RSS links to Politico, WBUR,
+        # Courthouse News and the Yakima Herald. Without this guard those were
+        # stored under ufw.org with UFW's agency id - attributing another
+        # publisher's copyrighted article to the wrong source, which for a
+        # newswire is a serious integrity problem, not a cosmetic one.
+        if registrable_domain(ref.url) != domain:
+            stats.off_domain += 1
+            continue
+
+        # Applies to EVERY source, feeds included. edisonohio.edu's /News feed
+        # carried /event/2026-08/welcome-week - a campus event, not a press
+        # release, and article-shaped enough to pass every other check.
+        if is_non_news_path(ref.url):
+            stats.non_news += 1
+            continue
+
+        # Feeds and CMS APIs only publish articles, so their URLs are trusted.
+        # Sitemaps and harvested links are not - they contain section indexes,
+        # tag pages and pagination, so those go through the classifier.
+        if ref.source in ("sitemap", "listing"):
+            verdict = classify_url(ref.url)
+            if not verdict.is_article:
+                continue
+
+        # Cheap check first - before spending a request.
+        if sink.seen_url(ref.url):
+            stats.already_seen += 1
+            # Feeds and sitemaps are reverse-chronological, so a run of
+            # already-seen items means we have caught up. This is the crawl
+            # budget optimisation v2 got right.
+            stale_streak += 1
+            if stale_streak >= 5:
+                break
+            continue
+        stale_streak = 0
+
+        article = await _extract_ref(fetcher, ref, stats)
+        if article is None:
+            stats.failed += 1
+            continue
+
+        if article.quality.get("needs_browser"):
+            stats.needs_browser += 1
+        if not article.usable:
+            stats.unusable += 1
+            continue
+
+        if article.date.value and article.date.value < cutoff:
+            stale_streak += 1
+            if stale_streak >= 5:
+                break
+            continue
+
+        twin = sink.seen_content(article.body)
+        if twin:
+            # Same body under a different URL: a syndicated press release.
+            # Worth recording as a cluster rather than silently dropping.
+            stats.body_text_dupes += 1
+
+        agency = tns.agencies.get(a_id) if tns is not None else None
+        if sink.write(article, domain=domain, a_id=a_id,
+                      agency_prefix=agency.prefix if agency else ""):
+            stats.stored += 1
+            stored_here += 1
+            if tns is not None:
+                load_to_tns(tns, sink, article, a_id=a_id, stats=stats)
+
+    return found.method, found.feed_url, found.feed_absent
+
+
+# What each TnsSink outcome means for whether the article should be offered
+# again. Only "error" is retryable; a rejection is a verdict, not a hiccup.
+_RETRYABLE = "insert_error"
+
+
+def load_to_tns(tns: "TnsSink", sink: Sink, article: Article, *, a_id: int,
+                stats: CrawlStats) -> str:
+    """Offer a stored article to `tns.press_release` and record the outcome.
+
+    Ordering matters: the JSONL row and the dedup index are written first,
+    because the scrape is a fact, while the load is an action that can fail.
+    Writing the load state back is what makes a failure retryable instead of
+    permanently invisible - the dedup index would otherwise mark the article
+    seen and it would never be offered again.
+    """
+    outcome = tns.load(
+        a_id=a_id,
+        headline=article.headline or "",
+        body=article.body or "",
+        published=article.date.value,
+        url=article.url,
+    )
+    if tns.dry_run:
+        # Nothing was written, so nothing may be recorded as written. Marking a
+        # dry run "loaded" would make the real run's backfill skip it.
+        stats.tns_loaded += 1 if outcome == "inserted" else 0
+        return outcome
+
+    if outcome == "inserted":
+        sink.mark_tns(article.url, "loaded", tns.last_filename)
+        stats.tns_loaded += 1
+    elif outcome == _RETRYABLE:
+        sink.mark_tns(article.url, "error")
+        stats.tns_failed += 1
+    else:
+        sink.mark_tns(article.url, f"rejected:{outcome}")
+        stats.tns_rejected += 1
+    return outcome
+
+
+def _prefer_section(refs, newsroom_url: str):
+    """Keep refs under the newsroom URL's section path, if any qualify."""
+    from urllib.parse import urlsplit
+
+    section = urlsplit(canonical_url(newsroom_url)).path.rstrip("/").lower()
+    # A one-segment section like /news is meaningful; the site root is not.
+    if not section or section.count("/") < 1 or len(section) < 3:
+        return refs
+    in_section = [r for r in refs
+                  if urlsplit(canonical_url(r.url)).path.lower().startswith(section + "/")]
+    return in_section or refs
+
+
+async def _extract_ref(fetcher: PoliteFetcher, ref: ArticleRef,
+                       stats: CrawlStats) -> Article | None:
+    """Build an Article from a reference, fetching only when necessary."""
+    fetched_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    # Route the date by WHERE it came from, because the two inputs rank very
+    # differently in the cascade. A feed's pubDate and a wp-json date_gmt are
+    # publisher-asserted and sit at the top; a sitemap's `lastmod` means
+    # "significantly modified", not "published", and sits near the bottom.
+    #
+    # Passing both through `feed_date` promoted lastmod to the most trusted
+    # signal there is. hccs.edu regenerated its sitemap and five articles from
+    # March, April, May and August all arrived stamped 24 August - beating the
+    # real date sitting in their own OpenGraph tags.
+    publisher_date = (ref.date_raw
+                      if ref.source in ("rss", "cms_api", "news_sitemap") else None)
+    lastmod = ref.date_raw if ref.source == "sitemap" else None
+
+    # A feed carrying content:encoded, or a wp-json post carrying rendered
+    # content, already has the full body - no article fetch at all. This is
+    # both the fastest path and the politest.
+    if ref.has_full_body:
+        article = extract_article(
+            ref.body_html or "", ref.url,
+            feed_headline=ref.headline, feed_date=publisher_date,
+            sitemap_lastmod=lastmod, feed_body=None, fetched_at=fetched_at,
+        )
+        if article.usable:
+            # trafilatura did the parsing, but the CONTENT came from the feed or
+            # CMS payload. Credit the real origin - provenance drives the drift
+            # monitoring, so "trafilatura" here would hide a source change.
+            article.body_source = (
+                ArticlePath.CMS_API if ref.source == "cms_api" else ArticlePath.FEED)
+            article.quality["body_source"] = article.body_source.value
+            article.quality["body_without_fetch"] = True
+            stats.bump(stats.by_body_source, article.body_source.value)
+            return article
+        # Fall through and fetch the real page if the embedded body was a stub.
+
+    resp = await fetcher.get(ref.url)
+    stats.fetched += 1
+    if not resp.ok:
+        return None
+
+    article = extract_article(
+        resp.text, ref.url,
+        feed_headline=ref.headline,
+        feed_date=publisher_date,
+        sitemap_lastmod=lastmod,
+        http_last_modified=resp.headers.get("last-modified"),
+        fetched_at=fetched_at,
+    )
+    stats.bump(stats.by_body_source, article.body_source.value)
+    return article
+
+
+async def crawl_once(
+    *,
+    settings: Settings | None = None,
+    frontier: Frontier | None = None,
+    sink: Sink | None = None,
+    tns: "TnsSink | None" = None,
+    domains: int = 10,
+    only_domains: list[str] | None = None,
+    only_a_id: int | None = None,
+    max_articles: int = 10,
+    max_age_days: int = 30,
+    concurrency: int = 8,
+    worker_id: str = "w1",
+    progress=None,
+) -> CrawlStats:
+    """Lease and crawl a batch of domains."""
+    settings = settings or Settings.load()
+    owns_frontier = frontier is None
+    owns_sink = sink is None
+    frontier = frontier or open_frontier()
+    sink = sink or Sink(settings.data_dir)
+    stats = CrawlStats()
+
+    try:
+        frontier.release_expired_leases()
+        # A named scope bypasses the due-queue; the schedule is what is being
+        # overridden, never the lease or the per-host pacing.
+        leased = (frontier.acquire_domains(worker_id, only_domains) if only_domains
+                  else frontier.acquire(worker_id, limit=domains))
+        stats.domains = len(leased)
+        if not leased:
+            return stats
+
+        sem = asyncio.Semaphore(concurrency)
+
+        async with PoliteFetcher(settings) as fetcher:
+
+            async def one_domain(record) -> None:
+                async with sem:
+                    method, feed_url, feed_absent = "none", None, False
+                    ok = False
+                    try:
+                        # Every target on this domain, under the one lease -
+                        # unless one agency was asked for by name, in which case
+                        # only its own newsroom URLs. house.gov carries 417.
+                        targets = record.targets or []
+                        if only_a_id is not None:
+                            targets = [t for t in targets if t.a_id == only_a_id]
+                        for target in targets:
+                            stats.targets += 1
+                            method, feed_url, feed_absent = await crawl_target(
+                                fetcher, sink,
+                                domain=record.domain,
+                                a_id=target.a_id,
+                                newsroom_url=target.newsroom_url,
+                                known_feed=target.feed_url,
+                                known_method=target.discovery_method,
+                                # Honour the cached verdict only while fresh.
+                                feed_absent=target.feed_absence_is_fresh(),
+                                max_articles=max_articles,
+                                max_age_days=max_age_days,
+                                stats=stats,
+                                tns=tns,
+                            )
+                            frontier.release_target(
+                                target.newsroom_url,
+                                success=method != "none",
+                                discovery_method=method if method != "none" else None,
+                                feed_url=feed_url,
+                                # Only write the verdict when we actually probed.
+                                feed_absent=True if feed_absent else None,
+                            )
+                            ok = ok or method != "none"
+                    except Exception as exc:                   # noqa: BLE001
+                        stats.errors.append(f"{record.domain}: {type(exc).__name__}: {exc}")
+                    finally:
+                        frontier.release(
+                            record.domain,
+                            success=ok,
+                            discovery_method=method if method != "none" else None,
+                            feed_url=feed_url,
+                        )
+                        if progress is not None:
+                            progress(record.domain)
+
+            await asyncio.gather(*(one_domain(r) for r in leased))
+    finally:
+        if owns_sink:
+            sink.close()
+        if owns_frontier:
+            frontier.close()
+
+    return stats

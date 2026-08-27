@@ -1,0 +1,9 @@
+# Sample newsroom URLs for smoke-testing the Phase 1 survey.
+# Chosen to match the target corpus profile (.gov / .edu institutional sites,
+# which are 53% of the reference corpus). Replace with the real target list.
+https://www.af.mil/News/
+https://news.mit.edu/
+https://www.nasa.gov/news/
+https://www.energy.gov/articles
+https://news.stanford.edu/
+https://www.nih.gov/news-events/news-releases

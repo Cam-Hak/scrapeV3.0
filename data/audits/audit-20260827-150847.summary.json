@@ -1,0 +1,31 @@
+{
+  "targets": 60,
+  "verdicts": {
+    "suspicious": 18,
+    "ok": 8,
+    "check": 28,
+    "broken": 6
+  },
+  "methods": {
+    "none": 4,
+    "cms_api": 15,
+    "sitemap": 7,
+    "listing": 21,
+    "rss": 13
+  },
+  "findings": {
+    "unreachable": 2,
+    "no_overlap": 14,
+    "last_resort": 21,
+    "low_overlap": 7,
+    "scattered": 9,
+    "off_domain": 4,
+    "unscoped": 1,
+    "no_articles": 2,
+    "non_news_heavy": 1
+  },
+  "median_overlap": 0.5,
+  "zero_yield": 2,
+  "unreachable": 2,
+  "pct_clean": 13.3
+}
