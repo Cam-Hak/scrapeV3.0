@@ -1,0 +1,27 @@
+{
+  "targets": 1,
+  "verdicts": {
+    "check": 1
+  },
+  "methods": {
+    "listing": 1
+  },
+  "findings": {
+    "last_resort": 1
+  },
+  "median_overlap": 1.0,
+  "zero_yield": 0,
+  "unreachable": 0,
+  "pct_clean": 0.0,
+  "by_tld": {
+    ".org": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 1,
+      "pct_workable": 100.0
+    }
+  },
+  "extraction": {
+    "probed": 0
+  }
+}

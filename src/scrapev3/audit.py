@@ -34,7 +34,7 @@ from selectolax.lexbor import LexborHTMLParser
 
 from .discover.sources import discover
 from .fetch import PoliteFetcher
-from .urls import canonical_url, is_non_news_path, registrable_domain
+from .urls import canonical_url, classify_url, is_non_news_path, registrable_domain
 
 # A result set whose links appear nowhere on the target page is the
 # fightcancer.org signature. Below this fraction, say so.
@@ -292,14 +292,37 @@ async def audit_target(fetcher: PoliteFetcher, *, a_id: int, domain: str,
     a.concentration = top_n / len(urls)
 
     if extract and urls:
-        await _probe_extraction(fetcher, a, urls)
+        await _probe_extraction(fetcher, a, urls, a.method)
 
     judge(a)
     return a
 
 
+def _first_crawlable(urls: list[str], method: str) -> str | None:
+    """The first result the real crawl loop would actually fetch.
+
+    An audit that probes a URL the crawler would have skipped is measuring
+    something that never happens. `crawl_target` puts sitemap- and
+    listing-sourced URLs through `classify_url`, because those sources contain
+    section indexes, search pages and pagination; feed and CMS-API URLs are
+    trusted because those sources only publish articles.
+
+    Skipping that gate here made extraction look far worse than it is: the
+    audit was fetching `sanjac.edu/about/news/index.php` and
+    `aarcorp.com/en/newsroom/search`, both of which the crawler rejects without
+    spending a request.
+    """
+    for u in urls:
+        if is_non_news_path(u):
+            continue
+        if method in ("sitemap", "listing") and not classify_url(u).is_article:
+            continue
+        return u
+    return None
+
+
 async def _probe_extraction(fetcher: PoliteFetcher, a: TargetAudit,
-                            urls: list[str]) -> None:
+                            urls: list[str], method: str) -> None:
     """Fetch the first discovered article and see whether it extracts.
 
     One article, not all of them: the question is whether this domain's pages
@@ -308,7 +331,11 @@ async def _probe_extraction(fetcher: PoliteFetcher, a: TargetAudit,
     """
     from .extract import extract_article
 
-    target = next((u for u in urls if not is_non_news_path(u)), urls[0])
+    target = _first_crawlable(urls, method)
+    if target is None:
+        a.extracted = False
+        a.extract_note = "no result survives the crawl's own URL gates"
+        return
     try:
         resp = await fetcher.get(target)
     except Exception as exc:                                # noqa: BLE001

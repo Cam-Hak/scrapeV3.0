@@ -180,6 +180,60 @@ def prose_ratio(text: str | None) -> float:
     return round((line_score + sentence_score) / 2, 3)
 
 
+# A window big enough to hold a few real paragraphs, so a high score means "a
+# substantial run of prose", not "one lucky sentence".
+PROSE_WINDOW_CHARS = 1500
+
+
+def best_prose_ratio(text: str | None, window_chars: int = PROSE_WINDOW_CHARS) -> float:
+    """The most prose-like any contiguous stretch of this text gets.
+
+    `prose_ratio` averages over the whole document, which quietly punishes a
+    shape that is extremely common in press releases: real prose followed by a
+    long list. A release ending in its 128 co-signing organisations - one name
+    per line - is mostly short lines by the time you reach the end, and the
+    average lands below the chrome floor.
+
+    Measured on a real ACS CAN release: 7,014 characters of genuine prose,
+    136 lines, median length 31, 94 lines under 40 characters because of the
+    signatory list. Whole-document score **0.215** - below the 0.254 that a
+    static "about" page scores, and rejected as page chrome. The same document
+    scores far higher over its opening.
+
+    So the question becomes "does a substantial run of this read like prose?"
+    rather than "does all of it?". Chrome has no such run anywhere; an article
+    with a trailing list does.
+    """
+    if not text:
+        return 0.0
+    if len(text) <= window_chars:
+        return prose_ratio(text)
+
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    if not lines:
+        return 0.0
+
+    best = 0.0
+    start = 0
+    while start < len(lines):
+        window, size = [], 0
+        for ln in lines[start:]:
+            window.append(ln)
+            size += len(ln) + 1
+            if size >= window_chars:
+                break
+        if size < window_chars and start > 0:
+            break                       # trailing remainder, already covered
+        best = max(best, prose_ratio("\n".join(window)))
+        if size < window_chars:
+            break
+        # Step half a window so a prose region is never split across a boundary
+        # and scored as two weak halves.
+        advance = max(1, len(window) // 2)
+        start += advance
+    return round(best, 3)
+
+
 def looks_like_navigation(text: str | None, threshold: float = 0.30) -> bool:
     """True when the extracted 'body' is really page chrome.
 
@@ -191,10 +245,13 @@ def looks_like_navigation(text: str | None, threshold: float = 0.30) -> bool:
     Threshold calibrated against the real corpus rather than guessed: that nav
     body scores 0.016 and a static "about" page 0.254, while genuine articles
     run 0.44-1.00. 0.30 sits in the gap.
+
+    Judged on the best window rather than the whole document - see
+    `best_prose_ratio` for why the average rejected real releases.
     """
     if not text:
         return True
-    return prose_ratio(text) < threshold
+    return best_prose_ratio(text) < threshold
 
 
 def detect_language(text: str | None) -> str | None:

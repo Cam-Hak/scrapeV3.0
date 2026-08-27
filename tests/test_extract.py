@@ -27,6 +27,7 @@ from scrapev3.extract import (
     token_overlap,
 )
 from scrapev3.extract.cascade import needs_browser
+from scrapev3.extract.body import best_prose_ratio
 from scrapev3.extract.dates import resolve_date
 from scrapev3.extract.models import Path
 from selectolax.lexbor import LexborHTMLParser
@@ -480,3 +481,90 @@ def test_the_crawl_loop_routes_dates_by_their_source():
     assert 'ref.source in ("rss", "cms_api", "news_sitemap")' in src
     assert "sitemap_lastmod=lastmod" in src
     assert "feed_date=ref.date_raw" not in src
+
+
+class TestProseRatioSurvivesATrailingList:
+    """Real prose followed by a long list is a very common press-release shape.
+
+    Averaging over the whole document punished it: an ACS CAN release of 7,014
+    characters of genuine prose scored 0.215 - below the 0.254 a static "about"
+    page scores - and was rejected as page chrome, because it ends with its 128
+    co-signing organisations, one name per line. 136 lines, median length 31,
+    94 of them under 40 characters.
+
+    The question the check should ask is "does a substantial run of this read
+    like prose?", not "does all of it?". Chrome has no such run anywhere.
+    """
+
+    # Paragraph-per-line, which is the shape trafilatura actually returns - not
+    # one unbroken string. The line-length half of the score depends on it.
+    PROSE = "\n".join([
+        "Today, the American Cancer Society Cancer Action Network, joined by 128 "
+        "other patient advocacy groups, submitted a letter responding to the "
+        "request for information issued by the Department of Health and Human "
+        "Services.",
+        "The letter urges the agency to remove financial barriers that keep "
+        "patients from taking part in clinical trials. Travel, lodging and lost "
+        "wages remain the most frequently cited obstacles for participants who "
+        "live far from a trial site.",
+        "Signatories asked that reimbursement be treated as a standard component "
+        "of trial design rather than an exception granted case by case. The "
+        "comment period closes next month.",
+        "The coalition also asked the agency to publish participation data by "
+        "region, so that gaps in access can be measured rather than inferred "
+        "from anecdote. Several members noted that rural patients travel farthest.",
+    ]) + "\n"
+    # One organisation per line - the shape that sinks the whole-document
+    # average. Deliberately free of sentence-ending punctuation, as real
+    # signatory lists are: an abbreviation like "Inc." sitting before a
+    # capitalised next line reads as a sentence terminator and quietly inflates
+    # the score, which is what made the first draft of this fixture fail to
+    # reproduce the bug at all.
+    SIGNATORIES = "\n".join([
+        "Unite for HER", "US Hereditary Angioedema Association",
+        "UsAgainstAlzheimer's", "wAIHA Warriors", "Women As One",
+        "Young Survival Coalition", "ZERO Prostate Cancer",
+        "American Lung Association", "Prevent Cancer Foundation",
+        "LUNGevity Foundation", "Triage Cancer", "Fight Colorectal Cancer",
+    ] * 12)
+
+    NAV = ("View the Main Menu\nSearch U.S. Travel Association\nFind Members\n"
+           "All Stakeholders\nContact Us\nLogin\nRegister\nAbout\nEvents\n"
+           "Research\nAdvocacy\nMembership\nNewsroom\nPress Releases\n"
+           "Media Contacts\nSubscribe\nFollow Us\n")
+
+    def test_the_trailing_list_drags_the_whole_document_average_down(self):
+        """The defect, stated as a measurement rather than an assertion of
+        intent - if this ever stops being true the fix is no longer needed."""
+        doc = self.PROSE + self.SIGNATORIES
+        assert prose_ratio(doc) < 0.30
+
+    def test_but_the_document_is_not_chrome(self):
+        doc = self.PROSE + self.SIGNATORIES
+        assert best_prose_ratio(doc) > 0.30
+        assert not looks_like_navigation(doc)
+
+    def test_a_long_nav_menu_is_still_chrome(self):
+        """Windowing must not become a way for page furniture to pass by having
+        one good stretch - chrome has no good stretch anywhere."""
+        big = self.NAV * 20
+        assert len(big) > 1500, "test setup: needs to exceed one window"
+        assert best_prose_ratio(big) < 0.30
+        assert looks_like_navigation(big)
+
+    def test_prose_buried_after_a_list_is_still_found(self):
+        """The window slides; it does not only look at the opening. A page that
+        leads with a link list and then carries the article still counts."""
+        doc = self.SIGNATORIES + "\n" + self.PROSE * 3
+        assert not looks_like_navigation(doc)
+
+    def test_short_bodies_are_unchanged(self):
+        """Below one window the measure is the original whole-document one, so
+        the calibration on short text is untouched."""
+        assert best_prose_ratio(self.NAV) == prose_ratio(self.NAV)
+        assert looks_like_navigation(self.NAV)
+
+    def test_empty_is_still_navigation(self):
+        assert best_prose_ratio(None) == 0.0
+        assert best_prose_ratio("") == 0.0
+        assert looks_like_navigation(None)

@@ -58,6 +58,9 @@ _SECTION_INDEX = re.compile(
     re.IGNORECASE,
 )
 _LISTING_QUERY = re.compile(r"^(page|paged|p|offset|start|pagenum)$", re.IGNORECASE)
+# A four-digit year standing alone as the last path segment: /news/2026. An
+# archive index, not an article, however much it resembles a numeric permalink.
+_BARE_YEAR = re.compile(r"(19|20)\d{2}")
 
 # Content that is not news, whatever its URL shape. Institutional sites - 53%
 # of this corpus is .edu/.gov - commonly publish one site-wide feed mixing
@@ -302,11 +305,19 @@ def classify_url(url: str) -> UrlVerdict:
         elif len(words) == 1 and not slug.isdigit():
             score -= 0.5
             reasons.append("single-word slug")
-        # A bare numeric id is a common article permalink on older CMSes.
+        # A bare numeric id is a common article permalink on older CMSes -
+        # /node/352363. A bare YEAR is the opposite: /news/2026 is a date
+        # archive index, and hccs.edu's sitemap is full of them. Both are four
+        # or more digits, so the id rule claimed the archives too and they
+        # reached extraction as "articles".
         if slug.isdigit() and len(slug) >= 4:
-            score += 1.0
-            has_article_signal = True
-            reasons.append("numeric article id")
+            if _BARE_YEAR.fullmatch(slug):
+                score -= 3.0
+                reasons.append("date archive index")
+            else:
+                score += 1.0
+                has_article_signal = True
+                reasons.append("numeric article id")
 
     if not has_article_signal:
         reasons.append("no positive article signal")

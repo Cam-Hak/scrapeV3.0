@@ -309,3 +309,29 @@ class TestWwwNormalisation:
         """Only `www.` is decorative. `newsroom.` and `www3.` are real hosts."""
         for host in ("newsroom.northumbria.ac.uk", "www3.nhk.or.jp", "media.srpnet.com"):
             assert host in canonical_url(f"https://{host}/x")
+
+
+class TestDateArchiveIsNotAnArticleId:
+    """`/news/2026` is a date archive index; `/node/352363` is a permalink.
+
+    Both are four-or-more digits standing alone as the last segment, so the
+    numeric-id rule claimed the archives too and hccs.edu's sitemap fed them to
+    extraction as articles. Extraction then correctly rejected them as page
+    chrome, which made a discovery defect look like an extraction one.
+    """
+
+    def test_a_bare_year_is_rejected(self):
+        for u in ("https://hccs.edu/news/2026", "https://x.org/archive/1998"):
+            assert not classify_url(u).is_article
+
+    def test_a_numeric_permalink_still_passes(self):
+        v = classify_url("https://x.org/node/352363")
+        assert v.is_article
+        assert "numeric article id" in v.reasons
+
+    def test_a_year_inside_a_dated_path_is_untouched(self):
+        """The rule is about a year as the FINAL segment. A year in the middle
+        of a date path is the strongest article signal there is."""
+        assert classify_url("https://x.org/news/2026/08/26/mayor-announces-plan").is_article
+        assert classify_url(
+            "https://hccs.edu/news/2026/april/us-economic-future-depends-on-work").is_article

@@ -222,3 +222,42 @@ def test_summary_survives_an_empty_run():
     s = summarize([])
     assert s["targets"] == 0
     assert s["pct_clean"] == 0.0
+
+
+class TestTheProbeModelsTheCrawl:
+    """An audit that probes a URL the crawler would skip measures nothing real.
+
+    `crawl_target` puts sitemap- and listing-sourced URLs through
+    `classify_url`, because those sources carry section indexes, search pages
+    and pagination; feed and CMS-API URLs are trusted because those sources
+    only publish articles. The extraction probe did not, so it was fetching
+    `sanjac.edu/about/news/index.php` and reporting the failure as extraction's
+    fault.
+    """
+
+    URLS = [
+        "https://sanjac.edu/about/news/index.php",
+        "https://sanjac.edu/about/news/_nav.ounav",
+        "https://sanjac.edu/about/news/college-names-new-provost-for-central-campus",
+    ]
+
+    def test_sitemap_results_are_gated_like_the_crawl_gates_them(self):
+        from scrapev3.audit import _first_crawlable
+        assert _first_crawlable(self.URLS, "sitemap") == self.URLS[2]
+
+    def test_feed_results_stay_trusted(self):
+        """Feeds only publish articles, so the crawl does not second-guess
+        them and neither should the probe - changing that would silently
+        narrow what the audit measures."""
+        from scrapev3.audit import _first_crawlable
+        assert _first_crawlable(self.URLS, "rss") == self.URLS[0]
+
+    def test_a_result_set_with_nothing_crawlable_says_so(self):
+        from scrapev3.audit import _first_crawlable
+        assert _first_crawlable(self.URLS[:2], "sitemap") is None
+
+    def test_non_news_paths_are_skipped_for_every_source(self):
+        from scrapev3.audit import _first_crawlable
+        urls = ["https://x.org/events/spring-gala-2026",
+                "https://x.org/news/mayor-announces-transit-plan"]
+        assert _first_crawlable(urls, "rss") == urls[1]

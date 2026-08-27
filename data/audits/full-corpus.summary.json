@@ -1,0 +1,304 @@
+{
+  "targets": 1747,
+  "verdicts": {
+    "broken": 537,
+    "ok": 437,
+    "suspicious": 294,
+    "check": 479
+  },
+  "methods": {
+    "none": 211,
+    "cms_api": 330,
+    "rss": 308,
+    "sitemap": 277,
+    "listing": 616,
+    "news_sitemap": 5
+  },
+  "findings": {
+    "unreachable": 149,
+    "page_too_thin": 30,
+    "extract_failed": 113,
+    "no_overlap": 176,
+    "low_overlap": 107,
+    "scattered": 259,
+    "last_resort": 616,
+    "article_unfetchable": 78,
+    "no_articles": 62,
+    "non_news_heavy": 27,
+    "unscoped": 50
+  },
+  "median_overlap": 0.9,
+  "zero_yield": 62,
+  "unreachable": 149,
+  "pct_clean": 25.0,
+  "by_tld": {
+    ".edu": {
+      "targets": 569,
+      "ok": 147,
+      "workable": 313,
+      "pct_workable": 55.0
+    },
+    ".org": {
+      "targets": 520,
+      "ok": 162,
+      "workable": 297,
+      "pct_workable": 57.1
+    },
+    ".com": {
+      "targets": 335,
+      "ok": 70,
+      "workable": 155,
+      "pct_workable": 46.3
+    },
+    ".gov": {
+      "targets": 106,
+      "ok": 18,
+      "workable": 54,
+      "pct_workable": 50.9
+    },
+    ".uk": {
+      "targets": 59,
+      "ok": 13,
+      "workable": 28,
+      "pct_workable": 47.5
+    },
+    ".au": {
+      "targets": 32,
+      "ok": 7,
+      "workable": 18,
+      "pct_workable": 56.2
+    },
+    ".ca": {
+      "targets": 29,
+      "ok": 4,
+      "workable": 13,
+      "pct_workable": 44.8
+    },
+    ".mil": {
+      "targets": 20,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".net": {
+      "targets": 10,
+      "ok": 4,
+      "workable": 7,
+      "pct_workable": 70.0
+    },
+    ".int": {
+      "targets": 8,
+      "ok": 0,
+      "workable": 3,
+      "pct_workable": 37.5
+    },
+    ".us": {
+      "targets": 7,
+      "ok": 4,
+      "workable": 6,
+      "pct_workable": 85.7
+    },
+    ".de": {
+      "targets": 4,
+      "ok": 0,
+      "workable": 1,
+      "pct_workable": 25.0
+    },
+    ".ie": {
+      "targets": 4,
+      "ok": 0,
+      "workable": 2,
+      "pct_workable": 50.0
+    },
+    ".eu": {
+      "targets": 4,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".hk": {
+      "targets": 4,
+      "ok": 1,
+      "workable": 2,
+      "pct_workable": 50.0
+    },
+    ".za": {
+      "targets": 4,
+      "ok": 1,
+      "workable": 3,
+      "pct_workable": 75.0
+    },
+    ".fi": {
+      "targets": 2,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".ch": {
+      "targets": 2,
+      "ok": 0,
+      "workable": 1,
+      "pct_workable": 50.0
+    },
+    ".jp": {
+      "targets": 2,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".dk": {
+      "targets": 2,
+      "ok": 0,
+      "workable": 1,
+      "pct_workable": 50.0
+    },
+    ".sg": {
+      "targets": 2,
+      "ok": 0,
+      "workable": 1,
+      "pct_workable": 50.0
+    },
+    ".law": {
+      "targets": 1,
+      "ok": 1,
+      "workable": 1,
+      "pct_workable": 100.0
+    },
+    ".tv": {
+      "targets": 1,
+      "ok": 1,
+      "workable": 1,
+      "pct_workable": 100.0
+    },
+    ".barclays": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 1,
+      "pct_workable": 100.0
+    },
+    ".honda": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".cat": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 1,
+      "pct_workable": 100.0
+    },
+    ".jm": {
+      "targets": 1,
+      "ok": 1,
+      "workable": 1,
+      "pct_workable": 100.0
+    },
+    ".ae": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".nl": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".mo": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".in": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".il": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".it": {
+      "targets": 1,
+      "ok": 1,
+      "workable": 1,
+      "pct_workable": 100.0
+    },
+    ".ee": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".ntt": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".cn": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 1,
+      "pct_workable": 100.0
+    },
+    ".nz": {
+      "targets": 1,
+      "ok": 1,
+      "workable": 1,
+      "pct_workable": 100.0
+    },
+    ".auto": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".institute": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 1,
+      "pct_workable": 100.0
+    },
+    ".aero": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 1,
+      "pct_workable": 100.0
+    },
+    ".ru": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".sport": {
+      "targets": 1,
+      "ok": 1,
+      "workable": 1,
+      "pct_workable": 100.0
+    },
+    ".no": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    }
+  },
+  "extraction": {
+    "probed": 1536,
+    "article_fetched": 1458,
+    "pct_fetched": 94.9,
+    "got_headline": 1446,
+    "got_body": 1399,
+    "got_date": 1443,
+    "usable": 1345,
+    "pct_usable_of_probed": 87.6
+  }
+}
