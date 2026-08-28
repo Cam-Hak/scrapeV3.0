@@ -40,6 +40,11 @@ data/surveys/
 data/articles/
 *.sqlite
 *.db
+# SQLite write-ahead log and shared-memory files. Transient state that every
+# crawl rewrites - articles.sqlite-wal was 3 MB of binary churn per commit.
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
 *.jsonl
 
 # --- database dumps ----------------------------------------------------
