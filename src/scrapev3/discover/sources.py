@@ -30,7 +30,10 @@ from urllib.parse import urljoin, urlsplit
 from selectolax.lexbor import LexborHTMLParser
 
 from ..fetch import PoliteFetcher
+from ..tracing import get as _get_logger, slug, tag
 from ..urls import canonical_url, classify_url, registrable_domain
+
+log = _get_logger(__name__)
 
 FEED_PATHS = ("/feed", "/rss", "/rss.xml", "/atom.xml", "/feed.xml", "/index.xml",
               "/feed/", "/news/feed", "/blog/feed")
@@ -90,6 +93,11 @@ class Discovery:
     # the result is the whole site rather than the target's own content. Such a
     # result is still usable, but it must not outrank the target's own page.
     scoped: bool = True
+    # The registrable domain discovery settled on, which is not always the one
+    # we were seeded with - see `_adopt`. The crawl applies the same
+    # own-content guard as `usable()` and has to judge against the same
+    # identity, or discovery accepts articles the crawl then throws away.
+    target_domain: str | None = None
 
 
 def _origin(url: str) -> str:
@@ -644,6 +652,35 @@ async def discover(
     if section and (section.count("/") < 1 or len(section) < 3):
         section = None          # site root is not a useful section hint
 
+    def _adopt(final_url: str) -> None:
+        """Follow the publisher to its new home when it redirects off-domain.
+
+        The seeded URL is where the publisher used to be; a redirect is the
+        publisher's own statement of where it is now. dni.gov's newsroom
+        redirects to www.odni.gov - a different registrable domain - so every
+        article discovery found was rejected by the own-content guard, which
+        exists to catch press-clipping feeds and cannot tell a rename from
+        someone else's newsroom. The target went permanently dead.
+
+        Only a redirect of the target page itself counts. A feed or sitemap
+        that points off-domain is exactly the case the guard is for, and is
+        left alone.
+        """
+        nonlocal base, seed, target_domain, section
+        moved = registrable_domain(final_url)
+        if not moved or moved == target_domain:
+            return              # same publisher, or nothing to learn
+        base = _origin(final_url)
+        seed = canonical_url(final_url)
+        target_domain = moved
+        section = urlsplit(seed).path.rstrip("/").lower() or None
+        if section and (section.count("/") < 1 or len(section) < 3):
+            section = None
+
+    log.debug("%s target %s  (%s)", tag(target_domain),
+              section or "whole site",
+              f"cached: {known_method}" if known_method else "cold")
+
     # Assigned by the listing fast path when it runs, so the full cascade below
     # reuses that response instead of fetching the same page twice.
     listing_html: str | None = None
@@ -676,6 +713,9 @@ async def discover(
         UFW's. Discovery declared success on the surviving 2 and never tried
         the listing page, which carries 24 actual UFW press releases.
         """
+        # By the time any source is judged, the target page has answered and
+        # `_adopt` has had its say, so this is the settled identity.
+        found.target_domain = target_domain
         total = len(found.articles)
         found.articles = [a for a in found.articles
                           if canonical_url(a.url) != seed
@@ -688,7 +728,13 @@ async def discover(
             found.notes.append(
                 f"ignoring {found.method}: {dropped} of {total} results are not "
                 f"{target_domain}")
+            log.debug("%s   %s rejected: %d of %d results are not %s",
+                      tag(target_domain), found.method, dropped, total,
+                      target_domain)
             return False
+        if dropped:
+            log.debug("%s   %s: dropped %d of %d (seed or off-domain)",
+                      tag(target_domain), found.method, dropped, total)
         return bool(found.articles)
 
     # ---- fast path -----------------------------------------------------
@@ -704,9 +750,14 @@ async def discover(
         # cascade fetches the listing page it would need anyway, then calls
         # wp-json at step 1) and buys the corroboration. Skipping that is how
         # aacr.org kept serving its blog to a /newsroom/news-releases target.
+        log.debug("%s fast path: cached cms_api", tag(target_domain))
         found = await from_wp_json(fetcher, base, limit=limit)
         if usable(found):
+            log.debug("%s won cms_api (fast path), %d articles",
+                      tag(target_domain), len(found.articles))
             return found
+        log.debug("%s fast path failed, running the full cascade",
+                  tag(target_domain))
     elif known_method == "rss" and known_feed and not _root_feed_for_section(
             known_feed, section):
         found = await from_feed(fetcher, known_feed)
@@ -728,7 +779,8 @@ async def discover(
         if resp.ok:
             listing_html = resp.text
             listing_url = resp.final_url or newsroom_url
-            found = await from_listing(fetcher, newsroom_url, listing_html,
+            _adopt(listing_url)
+            found = await from_listing(fetcher, seed, listing_html,
                                        limit=limit, section=section,
                                        base_url=listing_url)
             if usable(found):
@@ -755,25 +807,45 @@ async def discover(
         if resp.ok:
             listing_html = resp.text
             listing_url = resp.final_url or newsroom_url
+            log.debug("%s page %d, %s bytes%s", tag(target_domain),
+                      resp.status, f"{len(resp.text):,}",
+                      f"  -> {resp.final_url}" if resp.final_url != newsroom_url else "")
+            _adopt(listing_url)
         elif resp.wall:
+            log.debug("%s page is a bot wall (%s), stopping",
+                      tag(target_domain), resp.wall)
             out = Discovery(method="none")
             out.errors.append(f"bot wall: {resp.wall}")
             return out
         else:
             listing_error = (f"newsroom page: "
                              f"{resp.error or f'HTTP {resp.status}'}")
+            log.debug("%s page failed (%s), trying other sources",
+                      tag(target_domain), listing_error)
 
     # 1. WordPress REST - one request for headline + body + exact date.
     #    Corroborated like any other site-root source: `/wp-json/wp/v2/posts`
     #    is exactly as site-wide as `/rss.xml`, and aacr.org's serves the blog
     #    while the target is /about-the-aacr/newsroom/news-releases. Real
     #    articles, wrong section, no error - the same silent shape.
-    if listing_html and ("/wp-content/" in listing_html or "/wp-json" in listing_html):
+    wp_marker = None
+    if listing_html:
+        wp_marker = ("/wp-content/" if "/wp-content/" in listing_html
+                     else "/wp-json" if "/wp-json" in listing_html else None)
+        log.debug("%s wordpress %s", tag(target_domain),
+                  f"yes, {wp_marker} in page" if wp_marker else "no")
+    if wp_marker:
         found = await from_wp_json(fetcher, base, limit=limit)
+        log.debug("%s   wp-json %d posts", tag(target_domain),
+                  len(found.articles))
         if usable(found):
-            if _covers_target(found, listing_html, newsroom_url, section, False,
+            if _covers_target(found, listing_html, seed, section, False,
                               base_url=listing_url):
+                log.debug("%s won cms_api, %d articles", tag(target_domain),
+                          len(found.articles))
                 return found
+            log.debug("%s   wp-json covers the whole site, not %s - set aside",
+                      tag(target_domain), section)
             probe_notes.append(
                 f"ignoring site-wide CMS API: none of its posts appear under {section}")
 
@@ -787,11 +859,17 @@ async def discover(
         skip_probe=feed_absent or bool(known_feed), base_url=listing_url)
     if feed_url is None and known_feed and known_method == "rss":
         feed_url, declared = known_feed, False
+    log.debug("%s feed %s", tag(target_domain),
+              f"{feed_url}  ({'declared' if declared else 'probed'})"
+              if feed_url else "none")
     if feed_url:
         found = await from_feed(fetcher, feed_url)
+        log.debug("%s   feed %d items", tag(target_domain), len(found.articles))
         if usable(found) and _covers_target(
-                found, listing_html, newsroom_url, section, declared,
+                found, listing_html, seed, section, declared,
                 base_url=listing_url):
+            log.debug("%s won rss, %d articles", tag(target_domain),
+                      len(found.articles))
             return found
         if usable(found):
             out_note = (f"ignoring site-wide feed {feed_url}: none of its items "
@@ -800,9 +878,14 @@ async def discover(
 
     # 3. Sitemaps.
     found = await from_sitemap(fetcher, base, limit=limit, section=section)
+    log.debug("%s sitemap %d urls, scoped to %s: %s", tag(target_domain),
+              len(found.articles), section or "whole site",
+              "yes" if found.scoped else "no")
     if usable(found) and (found.scoped or not section):
         found.feed_absent = probed_empty
         found.notes.extend(probe_notes)
+        log.debug("%s won sitemap, %d articles", tag(target_domain),
+                  len(found.articles))
         return found
 
     # A sitemap that could not be scoped to the target's section is held in
@@ -810,22 +893,30 @@ async def discover(
     # explicit statement of what belongs in this section - outranks it.
     unscoped_sitemap = found if usable(found) else None
     if unscoped_sitemap is not None:
+        log.debug("%s   sitemap held in reserve (whole-site dump)",
+                  tag(target_domain))
         probe_notes.append(
             f"sitemap matched nothing under {section}; preferring the listing page")
 
     # 4. Listing page.
     if listing_html:
-        found = await from_listing(fetcher, newsroom_url, listing_html,
+        found = await from_listing(fetcher, seed, listing_html,
                                    limit=limit, section=section,
                                    base_url=listing_url)
         found.feed_absent = probed_empty
         found.notes.extend(probe_notes)
+        log.debug("%s listing %d article-shaped links", tag(target_domain),
+                  len(found.articles))
         if usable(found):
+            log.debug("%s won listing, %d articles", tag(target_domain),
+                      len(found.articles))
             return found
 
     if unscoped_sitemap is not None:
         unscoped_sitemap.feed_absent = probed_empty
         unscoped_sitemap.notes.extend(probe_notes)
+        log.debug("%s won sitemap from reserve, %d articles",
+                  tag(target_domain), len(unscoped_sitemap.articles))
         return unscoped_sitemap
 
     out = Discovery(method="none", feed_absent=probed_empty)
@@ -833,4 +924,6 @@ async def discover(
     if listing_error:
         out.errors.append(listing_error)
     out.errors.append("all discovery methods failed")
+    log.debug("%s no source produced this publisher's articles",
+              tag(target_domain))
     return out

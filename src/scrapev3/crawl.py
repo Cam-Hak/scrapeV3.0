@@ -29,6 +29,9 @@ from .frontier import Frontier, open_frontier
 from .urls import canonical_url, classify_url, is_non_news_path, registrable_domain
 from .settings import Settings
 from .sink import Sink
+from .tracing import get as _get_logger, slug, tag
+
+log = _get_logger(__name__)
 
 if TYPE_CHECKING:            # the TNS sink is optional; importing it is not
     from .tns import TnsSink
@@ -75,6 +78,10 @@ class CrawlStats:
     # discovery is building URLs that do not exist, or twenty sites each having
     # deleted one article, and those need completely different responses.
     failure_domains: dict[str, set[str]] = field(default_factory=dict)
+    # And the same for unusable articles. "no headline x6" was undiagnosable
+    # without it - six sites each losing one article and one site losing six
+    # are different problems, and only the second is worth chasing.
+    unusable_domains: dict[str, set[str]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     # The cascade declining a source is a decision, not a failure. Kept apart
     # from `errors` so that list stays worth reading.
@@ -116,6 +123,13 @@ async def crawl_target(
     # section names, and it falls back to everything if nothing matches.
     found.articles = _prefer_section(found.articles, newsroom_url)
 
+    # Which publisher's content counts as this target's own. Normally the
+    # frontier's domain, but a target whose newsroom page redirects to another
+    # registrable domain has moved, and its articles legitimately live there -
+    # dni.gov now serves from www.odni.gov. The frontier key stays put, since
+    # that is the agency's identity for TNS; only the guard follows.
+    publisher = found.target_domain or domain
+
     cutoff = datetime.utcnow() - timedelta(days=max_age_days)
     stored_here = 0
     stale_streak = 0
@@ -129,6 +143,7 @@ async def crawl_target(
         # alongside articles, and battelle.org's own newsroom URL was stored
         # with the site's nav text as its body before this guard existed.
         if canonical_url(ref.url) == seed:
+            log.debug("%s   - %-14s %s", tag(domain), "the seed page", slug(ref.url))
             continue
 
         # Only this publisher's own content. Plenty of organisations run
@@ -137,8 +152,10 @@ async def crawl_target(
         # stored under ufw.org with UFW's agency id - attributing another
         # publisher's copyrighted article to the wrong source, which for a
         # newswire is a serious integrity problem, not a cosmetic one.
-        if registrable_domain(ref.url) != domain:
+        if registrable_domain(ref.url) != publisher:
             stats.off_domain += 1
+            log.debug("%s   - %-14s %s  (not %s)", tag(domain), "off-domain",
+                      slug(ref.url), publisher)
             continue
 
         # Applies to EVERY source, feeds included. edisonohio.edu's /News feed
@@ -146,6 +163,7 @@ async def crawl_target(
         # release, and article-shaped enough to pass every other check.
         if is_non_news_path(ref.url):
             stats.non_news += 1
+            log.debug("%s   - %-14s %s", tag(domain), "not news", slug(ref.url))
             continue
 
         # Feeds and CMS APIs only publish articles, so their URLs are trusted.
@@ -154,11 +172,14 @@ async def crawl_target(
         if ref.source in ("sitemap", "listing"):
             verdict = classify_url(ref.url)
             if not verdict.is_article:
+                log.debug("%s   - %-14s %s  (score %.2f)", tag(domain),
+                          "not an article", slug(ref.url), verdict.score)
                 continue
 
         # Cheap check first - before spending a request.
         if sink.seen_url(ref.url):
             stats.already_seen += 1
+            log.debug("%s   - %-14s %s", tag(domain), "already have", slug(ref.url))
             # Feeds and sitemaps are reverse-chronological, so a run of
             # already-seen items means we have caught up. This is the crawl
             # budget optimisation v2 got right.
@@ -178,10 +199,14 @@ async def crawl_target(
         if reason is not None:
             stats.unusable += 1
             stats.bump(stats.by_unusable, reason)
+            stats.unusable_domains.setdefault(reason, set()).add(domain)
+            log.debug("%s   - %-14s %s", tag(domain), reason[:14], slug(ref.url))
             continue
 
         if article.date.value and article.date.value < cutoff:
             stats.too_old += 1
+            log.debug("%s   - %-14s %s  (%s)", tag(domain), "past window",
+                      slug(ref.url), article.date.value.date())
             stale_streak += 1
             if stale_streak >= 5:
                 break
@@ -198,6 +223,9 @@ async def crawl_target(
                       agency_prefix=agency.prefix if agency else ""):
             stats.stored += 1
             stored_here += 1
+            log.debug("%s   + %-14s %s  (%s chars, %s)", tag(domain), "stored",
+                      slug(ref.url), f"{article.body_len:,}",
+                      article.body_source.value)
             if tns is not None:
                 load_to_tns(tns, sink, article, a_id=a_id, stats=stats)
 

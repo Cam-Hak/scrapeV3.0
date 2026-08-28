@@ -42,8 +42,11 @@ from urllib.parse import urlsplit, urlunsplit
 from curl_cffi.requests import AsyncSession
 
 from ..settings import Settings
+from ..tracing import get as _get_logger, tag
 from ..urls import registrable_domain
 from .robots import RobotsRules, parse_robots
+
+log = _get_logger(__name__)
 
 # A bot wall returns HTTP 200 with plausible HTML, so status codes alone miss
 # it. The page <title> is the cheapest reliable tell. v2's logs recorded 47 of
@@ -272,7 +275,9 @@ class PoliteFetcher:
         now = time.monotonic()
         state = self._host_state(domain)
         if now < state.next_allowed_at:
-            await asyncio.sleep(state.next_allowed_at - now)
+            waited = state.next_allowed_at - now
+            log.debug("%s     wait %.1fs", tag(domain), waited)
+            await asyncio.sleep(waited)
         jitter = 1.0 + random.uniform(-self.settings.politeness.jitter_pct,
                                       self.settings.politeness.jitter_pct)
         state.next_allowed_at = time.monotonic() + max(0.0, delay * jitter)

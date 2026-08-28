@@ -762,3 +762,70 @@ class TestAnUnreachableNewsroomPageSaysSo:
                                known_method="listing", limit=10)
         newsroom_hits = [u for u in f.requested if u.endswith("/all-news")]
         assert len(newsroom_hits) == 1, f.requested
+
+
+class TestAPublisherThatMovedDomain:
+    """dni.gov's newsroom redirects to www.odni.gov - a different registrable
+    domain - and the target went permanently dead.
+
+    Every article discovery found lived on odni.gov, so the own-content guard
+    rejected all of them. That guard exists to catch press-clipping feeds
+    (ufw.org serving Courthouse News), and it cannot tell a rename from someone
+    else's newsroom. A redirect of the target page itself is the publisher's
+    own statement of where it now lives, so it is followed; a feed pointing
+    off-domain still is not.
+    """
+
+    HTML = """
+    <html><body><main>
+      <a href="/newsroom/press-releases/statement-on-annual-threat-assessment">One</a>
+      <a href="/newsroom/press-releases/director-remarks-at-summit-briefing">Two</a>
+    </main></body></html>
+    """
+    ASKED_FOR = "https://dni.gov/index.php/newsroom/press-releases"
+    MOVED_TO = "https://www.odni.gov/newsroom/press-releases"
+
+    class _Redirecting:
+        def __init__(self, html, moved_to):
+            self._html, self._moved = html, moved_to
+            self.requested: list[str] = []
+
+        async def robots_for(self, url):
+            class Rules:
+                sitemaps: list[str] = []
+            return Rules()
+
+        async def get(self, url, **kw):
+            self.requested.append(url)
+            r = type("R", (), {})()
+            r.ok, r.status, r.text = True, 200, self._html
+            r.final_url = self._moved          # every request lands on the new host
+            r.wall = r.error = None
+            r.from_cache, r.headers = False, {}
+            return r
+
+    async def test_articles_on_the_new_domain_survive(self):
+        f = self._Redirecting(self.HTML, self.MOVED_TO)
+        found = await sources.discover(f, self.ASKED_FOR, known_method="listing", limit=10)
+        assert found.articles, "the move must not empty the result set"
+        assert all("odni.gov" in a.url for a in found.articles), \
+            [a.url for a in found.articles]
+
+    async def test_discovery_reports_the_identity_it_settled_on(self):
+        """Discovery adopting the new domain is only half the fix. The crawl
+        applies the same own-content guard, and judged against the frontier's
+        original domain it rejected all nine odni.gov articles as
+        "off-domain (wrong publisher)" - discovery accepting them and the crawl
+        throwing them away. The settled identity has to travel with the result.
+        """
+        f = self._Redirecting(self.HTML, self.MOVED_TO)
+        found = await sources.discover(f, self.ASKED_FOR, known_method="listing", limit=10)
+        assert found.target_domain == "odni.gov"
+
+    async def test_a_target_that_did_not_move_reports_its_own_domain(self):
+        """The common case must be unchanged: no redirect, no adoption, and
+        the guard still judges against the domain we were seeded with."""
+        f = self._Redirecting(self.HTML, "https://www.odni.gov/newsroom/press-releases")
+        found = await sources.discover(f, "https://odni.gov/newsroom/press-releases",
+                                       known_method="listing", limit=10)
+        assert found.target_domain == "odni.gov"

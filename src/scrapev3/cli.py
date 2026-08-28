@@ -364,6 +364,14 @@ def _cmd_frontier_stats(args: argparse.Namespace) -> int:
 
 def _cmd_crawl(args: argparse.Namespace) -> int:
     """Lease domains, discover articles, extract, and store them."""
+    debug = getattr(args, "debug", False)
+    if debug:
+        from .tracing import enable as enable_tracing
+
+        # The same Console the progress bar uses, so rich keeps the bar on the
+        # bottom row and prints each decision above it instead of into it.
+        enable_tracing(console)
+
     from .crawl import crawl_once
     from .frontier import open_frontier
     from .sink import Sink
@@ -433,6 +441,13 @@ def _cmd_crawl(args: argparse.Namespace) -> int:
         console.print("[dim]Sink: JSONL only (--sink tns to load press_release)[/dim]")
     console.print()
 
+    run = dict(
+        settings=settings, frontier=frontier, sink=sink, tns=tns,
+        domains=args.domains, only_domains=only_domains,
+        only_a_id=args.a_id, max_articles=args.max_articles,
+        max_age_days=args.max_age_days, concurrency=args.concurrency,
+    )
+
     try:
         with Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -448,13 +463,7 @@ def _cmd_crawl(args: argparse.Namespace) -> int:
                 progress.advance(task)
                 progress.update(task, description=f"crawling [dim]{domain[:38]}[/dim]")
 
-            stats = asyncio.run(crawl_once(
-                settings=settings, frontier=frontier, sink=sink, tns=tns,
-                domains=args.domains, only_domains=only_domains,
-                only_a_id=args.a_id, max_articles=args.max_articles,
-                max_age_days=args.max_age_days, concurrency=args.concurrency,
-                progress=tick,
-            ))
+            stats = asyncio.run(crawl_once(progress=tick, **run))
         out_path = sink.path
         sink_stats = sink.stats()
     finally:
@@ -506,10 +515,13 @@ def _cmd_crawl(args: argparse.Namespace) -> int:
 
     if stats.by_unusable:
         u = Table(title="Why articles were unusable", header_style="bold")
-        u.add_column("Reason")
+        u.add_column("Reason", overflow="fold")
         u.add_column("Articles", justify="right")
+        u.add_column("Domains", overflow="fold")
         for k, v in sorted(stats.by_unusable.items(), key=lambda kv: -kv[1]):
-            u.add_row(k, str(v))
+            doms = sorted(stats.unusable_domains.get(k, ()))
+            shown = ", ".join(doms[:3]) + (f" +{len(doms) - 3}" if len(doms) > 3 else "")
+            u.add_row(k, str(v), shown)
         console.print(u)
 
     if stats.by_body_source:
@@ -1256,6 +1268,9 @@ def main(argv: list[str] | None = None) -> int:
                               "they are fetched again instead of skipped as seen")
     p_crawl.add_argument("--sink", choices=["jsonl", "tns"], default=None,
                          help="Override SCRAPEV3_SINK. 'tns' also loads tns.press_release")
+    p_crawl.add_argument("--debug", action="store_true",
+                         help="Log every decision: which source won and why, and "
+                              "why each discovered article was kept or dropped")
     p_crawl.add_argument("--dry-run", action="store_true",
                          help="With --sink tns: compose the rows but write nothing to MySQL")
     p_crawl.set_defaults(func=_cmd_crawl)
