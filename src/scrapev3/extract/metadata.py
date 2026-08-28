@@ -217,6 +217,74 @@ _TITLE_CHROME = {
 _TITLE_SEPARATORS = (" | ", " - ", " — ", " – ", " :: ", " » ", " > ", "|")
 
 
+def site_name_from_title(title: str) -> str | None:
+    """The site name, when the <title> gives it away by repeating it.
+
+    A CMS that appends the site name to a title which already ends in it
+    produces "Headline | Site | Site". lung.org does exactly that, and offers
+    no og:site_name to strip against, so its releases stored "... | American
+    Lung Association" as part of the headline - which flows through to
+    press_release.headline and the $H filename.
+
+    The doubled tail is the whole evidence. Without it this returns None rather
+    than guessing, because the alternative - assuming the last segment of any
+    title is the site name - truncates every real headline containing a dash.
+    """
+    parts: list[str] = [title]
+    for sep in _TITLE_SEPARATORS:
+        parts = [piece for part in parts for piece in part.split(sep)]
+    cleaned = [p.strip() for p in parts if p.strip()]
+    if len(cleaned) >= 3 and cleaned[-1] == cleaned[-2]:
+        return cleaned[-1]
+    return None
+
+
+def strip_title_chrome(value: str, site_name: str | None = None) -> str | None:
+    """Remove site and section chrome from a headline candidate.
+
+    `headline_from_title` only ever ran on `<title>`, so chrome arriving via
+    `og:title` sailed straight through. It does arrive that way: lung.org
+    serves `og:title` of "Press Releases | American Lung Association" on every
+    individual release, and centerforfoodsafety.org serves
+    "Center for Food Safety | Press Releases |  | Lawsuit Filed to Stop...".
+    Both stored a headline that describes the section, not the article.
+
+    Deliberately conservative, because this now runs on candidates that are
+    usually clean. Three outcomes:
+
+      * no segment was recognised as chrome -> the value is returned untouched,
+        so an ordinary headline containing " - " is never truncated;
+      * chrome was found and something survives -> the longest survivor;
+      * nothing survives -> None, meaning "this candidate is entirely chrome",
+        and the caller should fall through to the next headline source.
+    """
+    parts: list[str] = [value]
+    for sep in _TITLE_SEPARATORS:
+        parts = [piece for part in parts for piece in part.split(sep)]
+    if len(parts) < 2:
+        return value
+
+    site = (site_name or "").strip().lower()
+    kept: list[str] = []
+    dropped = False
+    for part in parts:
+        candidate = part.strip()
+        if not candidate:
+            dropped = True          # the empty segment in "A |  | B"
+            continue
+        low = candidate.lower()
+        if (site and low == site) or low in _TITLE_CHROME:
+            dropped = True
+            continue
+        kept.append(candidate)
+
+    if not dropped:
+        return value                # nothing here was chrome - leave it alone
+    if not kept:
+        return None                 # all chrome, no headline
+    return max(kept, key=len)
+
+
 def headline_from_title(title: str, site_name: str | None = None) -> str:
     """Pull the headline out of a <title>, whichever end the chrome is on.
 

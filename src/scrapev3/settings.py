@@ -99,6 +99,19 @@ class Politeness:
     # Latency-adaptive backoff: if a host's current latency exceeds this
     # multiple of its rolling p50, double the delay even on HTTP 200.
     latency_backoff_multiple: float = field(default_factory=lambda: _env_f("LATENCY_BACKOFF_MULTIPLE", 2.0))
+    # Consecutive refusals (403 or a bot wall) before this host is left alone.
+    # A run of them is an answer, not a transient fault: news.csub.edu served a
+    # Cloudflare 403 to fourteen consecutive article fetches in one pass, each
+    # one paid for with the full per-host delay. Continuing to knock is both
+    # impolite and pointless.
+    max_consec_refusals: int = field(default_factory=lambda: _env_i("MAX_CONSEC_REFUSALS", 5))
+    refusal_cooldown_s: float = field(default_factory=lambda: _env_f("REFUSAL_COOLDOWN_S", 900.0))
+    # Redirect hops before giving up. curl's default is 30, and redirects are
+    # followed INSIDE curl - they never reach _wait_turn, so a loop emits them
+    # back-to-back with no pacing at all. ersnet.org 301s /news-and-features/
+    # /news/ to itself forever: ten article fetches became ~300 unpaced
+    # requests to one host. A real article is never thirty hops away.
+    max_redirects: int = field(default_factory=lambda: _env_i("MAX_REDIRECTS", 5))
 
 
 @dataclass(frozen=True)

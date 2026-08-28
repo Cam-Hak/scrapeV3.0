@@ -48,12 +48,37 @@ class CrawlStats:
     unusable: int = 0
     off_domain: int = 0
     non_news: int = 0
+    # Not a failure. robots.txt told us not to, and we did not - filing that
+    # under "Why fetches failed" alongside 404s and timeouts is the same
+    # mistake as filing a declined site-wide source under "errors": it makes
+    # correct behaviour look like breakage and trains you to skim the list.
+    robots_disallowed: int = 0
+    # Articles the fetch reached but the window excluded. Counted because an
+    # uncounted drop is indistinguishable from a bug: a run reporting 174
+    # discovered, 36 stored and zero in every rejection row looks broken, and
+    # the honest answer was "the rest were older than --max-age-days".
+    too_old: int = 0
     tns_loaded: int = 0
     tns_rejected: int = 0
     tns_failed: int = 0
     by_method: dict[str, int] = field(default_factory=dict)
     by_body_source: dict[str, int] = field(default_factory=dict)
+    # Why fetches failed, tallied by reason. `failed: 15` with no breakdown is
+    # not a diagnosis - one site 404ing every URL and fifteen sites timing out
+    # once each are the same number and completely different problems.
+    by_failure: dict[str, int] = field(default_factory=dict)
+    # Which requirement an unusable article failed. Same reasoning as
+    # by_failure: the count alone does not say what to go and look at.
+    by_unusable: dict[str, int] = field(default_factory=dict)
+    # Which domains produced each failure reason. A reason without attribution
+    # is only half a diagnosis: "HTTP 404 x20" could be one site whose
+    # discovery is building URLs that do not exist, or twenty sites each having
+    # deleted one article, and those need completely different responses.
+    failure_domains: dict[str, set[str]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    # The cascade declining a source is a decision, not a failure. Kept apart
+    # from `errors` so that list stays worth reading.
+    notes: list[str] = field(default_factory=list)
 
     def bump(self, bucket: dict[str, int], key: str) -> None:
         bucket[key] = bucket.get(key, 0) + 1
@@ -82,6 +107,8 @@ async def crawl_target(
     stats.discovered += len(found.articles)
     for err in found.errors:
         stats.errors.append(f"{domain}: {err}")
+    for note in found.notes:
+        stats.notes.append(f"{domain}: {note}")
 
     # Prefer articles under the target's own section. edisonohio.edu's target
     # is /News, but its site-wide feed also carries /about/edison-foundation/*
@@ -141,18 +168,20 @@ async def crawl_target(
             continue
         stale_streak = 0
 
-        article = await _extract_ref(fetcher, ref, stats)
+        article = await _extract_ref(fetcher, ref, stats, domain)
         if article is None:
-            stats.failed += 1
-            continue
+            continue        # _extract_ref has already classified and counted it
 
         if article.quality.get("needs_browser"):
             stats.needs_browser += 1
-        if not article.usable:
+        reason = article.unusable_reason
+        if reason is not None:
             stats.unusable += 1
+            stats.bump(stats.by_unusable, reason)
             continue
 
         if article.date.value and article.date.value < cutoff:
+            stats.too_old += 1
             stale_streak += 1
             if stale_streak >= 5:
                 break
@@ -229,7 +258,7 @@ def _prefer_section(refs, newsroom_url: str):
 
 
 async def _extract_ref(fetcher: PoliteFetcher, ref: ArticleRef,
-                       stats: CrawlStats) -> Article | None:
+                       stats: CrawlStats, domain: str = "") -> Article | None:
     """Build an Article from a reference, fetching only when necessary."""
     fetched_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -270,6 +299,17 @@ async def _extract_ref(fetcher: PoliteFetcher, ref: ArticleRef,
     resp = await fetcher.get(ref.url)
     stats.fetched += 1
     if not resp.ok:
+        # A wall answers 200, so the status alone would report "HTTP 200" for
+        # a page we never actually got.
+        reason = resp.error or (f"bot wall: {resp.wall}" if resp.wall
+                                else f"HTTP {resp.status}")
+        if reason == "robots-disallow":
+            stats.robots_disallowed += 1
+            return None
+        stats.failed += 1
+        stats.bump(stats.by_failure, reason)
+        if domain:
+            stats.failure_domains.setdefault(reason, set()).add(domain)
         return None
 
     article = extract_article(

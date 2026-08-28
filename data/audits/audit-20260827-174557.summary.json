@@ -1,0 +1,27 @@
+{
+  "targets": 1,
+  "verdicts": {
+    "broken": 1
+  },
+  "methods": {
+    "sitemap": 1
+  },
+  "findings": {
+    "no_overlap": 1
+  },
+  "median_overlap": 0.0,
+  "zero_yield": 0,
+  "unreachable": 0,
+  "pct_clean": 0.0,
+  "by_tld": {
+    ".edu": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    }
+  },
+  "extraction": {
+    "probed": 0
+  }
+}

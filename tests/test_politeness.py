@@ -242,3 +242,218 @@ class TestPerIpConcurrency:
 
         assert first == second
         assert len(calls) == 1, f"resolved {len(calls)} times, expected 1"
+
+
+class TestWwwFallback:
+    """Canonicalisation strips `www.`, which is right for identity and is not
+    an assertion that the apex host serves anything.
+
+    Two of ten domains in one run were unreachable for exactly that reason:
+    ardian.com has no A record at all, and escardio.org resolves to a different
+    host than www.escardio.org and fails TLS there. Both work once the
+    conventional host is restored.
+    """
+
+    def test_subdomains_get_the_variant_too(self):
+        """law.georgetown.edu does not resolve; www.law.georgetown.edu does.
+        Restricting this to apex hosts left that target permanently dead, so
+        the rule is "any host that is not already www", and the DNS failure
+        does the deciding."""
+        from scrapev3.fetch.client import _with_www
+
+        assert _with_www("https://ardian.com/news") == "https://www.ardian.com/news"
+        assert _with_www("https://bma.org.uk/news") == "https://www.bma.org.uk/news"
+        assert _with_www("https://law.georgetown.edu/news") ==             "https://www.law.georgetown.edu/news"
+        # Already www: there is no further variant to try.
+        assert _with_www("https://www.ardian.com/news") is None
+
+    def test_the_query_and_path_survive_the_rewrite(self):
+        from scrapev3.fetch.client import _with_www
+
+        assert _with_www("https://escardio.org/news/press?page=1&q=") == \
+            "https://www.escardio.org/news/press?page=1&q="
+
+    async def test_a_dns_failure_retries_on_www_and_a_404_does_not(self):
+        """The retry is gated on "no server ever answered". A real 404 is a
+        real answer about a real host, and re-requesting it would spend a
+        second paced request to learn nothing."""
+        attempts: list[str] = []
+
+        class _Fetcher(PoliteFetcher):
+            async def _get_once(self, url, **kw):
+                attempts.append(url)
+                from scrapev3.fetch.client import Response
+
+                if url.startswith("https://www."):
+                    return Response(url=url, final_url=url, status=200, text="ok",
+                                    headers={}, elapsed_s=0.0)
+                return Response(url=url, final_url=url, status=0, text="", headers={},
+                                elapsed_s=0.0,
+                                error="DNSError: curl: (6) Could not resolve host")
+
+        f = _Fetcher(Settings.load())
+        resp = await f.get("https://ardian.com/news")
+        assert resp.ok and resp.url == "https://www.ardian.com/news"
+        assert len(attempts) == 2
+
+        attempts.clear()
+
+        class _NotFound(PoliteFetcher):
+            async def _get_once(self, url, **kw):
+                attempts.append(url)
+                from scrapev3.fetch.client import Response
+
+                return Response(url=url, final_url=url, status=404, text="",
+                                headers={}, elapsed_s=0.0)
+
+        resp = await _NotFound(Settings.load()).get("https://ardian.com/gone")
+        assert not resp.ok
+        assert len(attempts) == 1, "a 404 must not trigger the www retry"
+
+
+class TestRefusalsStopTheKnocking:
+    """A run of 403s is a verdict, not a transient fault.
+
+    news.csub.edu served a Cloudflare 403 to fourteen consecutive article
+    fetches in one pass - each one waiting out the full per-host delay first,
+    and each one certain to be refused. The circuit breaker existed but only
+    opened on 429/503, so refusals were paid for in full on every run.
+    """
+
+    def _state_after(self, n_refusals: int, status: int = 403):
+        from scrapev3.fetch.client import Response, _HostState
+
+        f = PoliteFetcher(Settings.load())
+        state = _HostState()
+        for _ in range(n_refusals):
+            f._apply_backoff(state, Response(url="https://x.test/a", final_url="https://x.test/a",
+                                             status=status, text="", headers={}, elapsed_s=0.1))
+        return state
+
+    def test_the_circuit_opens_after_the_threshold(self):
+        import time as _t
+
+        state = self._state_after(Settings.load().politeness.max_consec_refusals)
+        assert state.blocked_until > _t.monotonic(), "host should be left alone"
+
+    def test_one_refusal_does_not_open_it(self):
+        """A single 403 is ordinary - a robots-protected path, a stale link.
+        Only a run of them says the host is refusing us."""
+        state = self._state_after(1)
+        assert state.blocked_until == 0.0
+
+    def test_a_success_clears_the_streak(self):
+        from scrapev3.fetch.client import Response
+
+        f = PoliteFetcher(Settings.load())
+        state = self._state_after(2)
+        assert state.consec_failures == 2
+        f._apply_backoff(state, Response(url="https://x.test/a", final_url="https://x.test/a",
+                                         status=200, text="ok", headers={}, elapsed_s=0.1))
+        assert state.consec_failures == 0
+
+
+class TestRedirectsAreBounded:
+    """Redirects are followed inside curl, so they never reach _wait_turn.
+
+    ersnet.org 301s /news-and-features/news/ to itself forever. At curl's
+    default of 30 hops, ten article fetches became roughly three hundred
+    back-to-back unpaced requests to one host - a politeness failure that no
+    per-host delay could see, because the delay is applied per get() call.
+    """
+
+    def test_the_cap_is_well_below_curls_default(self):
+        pol = Settings.load().politeness
+        assert pol.max_redirects <= 10, "a real article is never ten hops away"
+        assert pol.max_redirects >= 1, "some sites legitimately redirect once"
+
+    def test_the_session_is_configured_with_it(self):
+        """Pins the wiring, not just the value - the setting is worthless if it
+        never reaches the session."""
+        import inspect
+
+        from scrapev3.fetch import client
+
+        src = inspect.getsource(client.PoliteFetcher.__aenter__)
+        assert "max_redirects" in src
+
+
+class TestTheBreakerSaysWhyItOpened:
+    """A breaker that hides its cause replaces one silent failure with another.
+
+    One run reported "circuit-open: host backing off x11" and nothing else: the
+    failures that tripped it happened during discovery, which does not feed the
+    crawl's failure tally, so the article fetches that followed only ever saw
+    an open circuit. The reason now travels with it.
+    """
+
+    def _tripped(self, status=403, n=None):
+        from scrapev3.fetch.client import Response, _HostState
+
+        pol = Settings.load().politeness
+        f = PoliteFetcher(Settings.load())
+        state = _HostState()
+        for _ in range(n or pol.max_consec_refusals):
+            f._apply_backoff(state, Response(url="https://x.test/a", final_url="https://x.test/a",
+                                             status=status, text="", headers={}, elapsed_s=0.1))
+        return state
+
+    def test_a_refusal_streak_records_its_cause(self):
+        state = self._tripped()
+        assert state.blocked_reason and "403" in state.blocked_reason
+
+    def test_a_503_records_its_cause(self):
+        state = self._tripped(status=503, n=1)
+        assert state.blocked_reason == "HTTP 503"
+
+    def test_recovery_clears_the_reason(self):
+        from scrapev3.fetch.client import Response
+
+        f = PoliteFetcher(Settings.load())
+        state = self._tripped()
+        assert state.blocked_reason is not None
+        f._apply_backoff(state, Response(url="https://x.test/a", final_url="https://x.test/a",
+                                         status=200, text="ok", headers={}, elapsed_s=0.1))
+        assert state.blocked_reason is None
+
+
+class TestJsChallengeWalls:
+    """A wall arrives two ways, and both answer HTTP 200.
+
+    The rendered kind says so in its <title>. The other is a bare script that
+    would run in a browser: justice.gov serves 2.6 KB containing
+    triggerInterstitialChallenge() and no text at all. That read as
+    "needs_browser: low text yield", so every article was queued for a browser
+    that would meet the same challenge - and because it was never classified as
+    a refusal, the host was never backed off from either.
+    """
+
+    CHALLENGE = ('<html><head></head><body>&nbsp;<script>var i = 1787874706;'
+                 ' function triggerInterstitialChallenge() {'
+                 ' var xhr = new XMLHttpRequest(); }</script></body></html>')
+
+    def test_a_script_only_challenge_is_a_wall(self):
+        assert detect_wall(self.CHALLENGE)
+
+    def test_the_marker_names_the_vendor(self):
+        assert "triggerinterstitialchallenge" in detect_wall(self.CHALLENGE)
+
+    def test_an_ordinary_short_page_is_not_a_wall(self):
+        assert detect_wall("<html><title>News</title><body>"
+                           + "word " * 200 + "</body></html>") is None
+
+    def test_a_real_article_mentioning_a_vendor_is_not_a_wall(self):
+        """The size gate is what makes the marker list safe: an article about
+        bot protection is still an article, and it is never 8 KB."""
+        page = ("<html><title>How the challenge-platform works</title><body>"
+                + "word " * 3000 + "</body></html>")
+        assert len(page) > 8192
+        assert detect_wall(page) is None
+
+    def test_a_wall_is_not_ok_even_at_200(self):
+        from scrapev3.fetch.client import Response
+
+        r = Response(url="https://x.test/a", final_url="https://x.test/a", status=200,
+                     text=self.CHALLENGE, headers={}, elapsed_s=0.1,
+                     wall=detect_wall(self.CHALLENGE))
+        assert not r.ok, "200 plus a challenge is not a successful fetch"

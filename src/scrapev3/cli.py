@@ -474,8 +474,10 @@ def _cmd_crawl(args: argparse.Namespace) -> int:
         ("  pages fetched", stats.fetched),
         ("  [green]stored[/green]", stats.stored),
         ("  unusable (short/no date)", stats.unusable),
+        ("  older than the window", stats.too_old),
         ("  off-domain (wrong publisher)", stats.off_domain),
         ("  non-news (events/staff/courses)", stats.non_news),
+        ("  robots.txt disallowed", stats.robots_disallowed),
         ("  needed a browser", stats.needs_browser),
         ("  body text dupes", stats.body_text_dupes),
         ("  failed", stats.failed),
@@ -490,6 +492,25 @@ def _cmd_crawl(args: argparse.Namespace) -> int:
         for k, v in sorted(stats.by_method.items(), key=lambda kv: -kv[1]):
             m.add_row(k, str(v))
         console.print(m)
+
+    if stats.by_failure:
+        f = Table(title="Why fetches failed", header_style="bold")
+        f.add_column("Reason", overflow="fold")
+        f.add_column("Articles", justify="right")
+        f.add_column("Domains", overflow="fold")
+        for k, v in sorted(stats.by_failure.items(), key=lambda kv: -kv[1]):
+            doms = sorted(stats.failure_domains.get(k, ()))
+            shown = ", ".join(doms[:3]) + (f" +{len(doms) - 3}" if len(doms) > 3 else "")
+            f.add_row(k, str(v), shown)
+        console.print(f)
+
+    if stats.by_unusable:
+        u = Table(title="Why articles were unusable", header_style="bold")
+        u.add_column("Reason")
+        u.add_column("Articles", justify="right")
+        for k, v in sorted(stats.by_unusable.items(), key=lambda kv: -kv[1]):
+            u.add_row(k, str(v))
+        console.print(u)
 
     if stats.by_body_source:
         b = Table(title="Where the body came from", header_style="bold")
@@ -510,6 +531,16 @@ def _cmd_crawl(args: argparse.Namespace) -> int:
         console.print(f"\n[yellow]{len(stats.errors)} error(s), first few:[/yellow]")
         for err in stats.errors[:8]:
             console.print(f"  [dim]{err[:110]}[/dim]")
+
+    # Not errors: the cascade declining a site-wide source because it could not
+    # be tied to the target's own section. Printed apart from the error list so
+    # a healthy run stops looking like a broken one - nine "errors" on a run
+    # with nothing wrong is how an error list stops being read at all.
+    if stats.notes:
+        console.print(f"\n[dim]{len(stats.notes)} note(s) - sources declined "
+                      f"for the right reasons:[/dim]")
+        for note in stats.notes[:6]:
+            console.print(f"  [dim]{note[:110]}[/dim]")
 
     console.print(
         f"\nTotal stored to date: [bold]{sink_stats['articles']:,}[/bold] articles "

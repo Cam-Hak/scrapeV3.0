@@ -75,6 +75,8 @@ _NON_ARTICLE_SECTION = re.compile(
     r"|location|locations|campus|facility|facilities"
     r"|product|products|service|services|shop|store|cart|checkout"
     r"|login|register|account|donate|give|giving|contact|privacy|terms"
+    r"|video|videos|photo|photos|gallery|galleries|multimedia"
+    r"|podcast|podcasts|audio|webcast|webcasts"
     r"|faq|faqs|sitemap|search-results)(/|$)",
     re.IGNORECASE,
 )

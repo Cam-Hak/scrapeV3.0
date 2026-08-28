@@ -38,6 +38,8 @@ from .metadata import (
     extract_jsonld,
     extract_meta,
     extract_microdata_dates,
+    site_name_from_title,
+    strip_title_chrome,
     headline_from_dom,
 )
 from .models import Article, Path
@@ -101,17 +103,33 @@ def extract_article(
 
     # ---- headline ----------------------------------------------------
     # Feed and CMS-API titles are publisher-asserted and beat anything scraped.
+    # Every candidate is chrome-checked, not just <title>: lung.org serves an
+    # og:title of "Press Releases | American Lung Association" on each
+    # individual release, which is the section's name and never the article's.
+    # A candidate that is nothing but chrome is skipped so the next source gets
+    # its turn, rather than being stored as a plausible-looking wrong headline.
+    site = site_name or meta.get("og:site_name")
+    if not site:
+        # No og:site_name. The <title> still names the site when the CMS has
+        # appended it to a title that already ended in it - see
+        # site_name_from_title. Nothing is inferred without that evidence.
+        title_node = tree.css_first("title")
+        if title_node is not None:
+            site = site_name_from_title(title_node.text(strip=True))
     for source, value in (
         (Path.FEED, feed_headline),
         (Path.JSONLD, facts.headline),
         (Path.OPENGRAPH, meta.get("og:title") or meta.get("twitter:title")),
     ):
         if value and value.strip():
-            article.headline = value.strip()
+            cleaned = strip_title_chrome(value.strip(), site)
+            if not cleaned:
+                continue
+            article.headline = cleaned
             article.headline_source = source
             break
     if not article.headline:
-        dom_headline = headline_from_dom(tree, site_name=site_name or meta.get("og:site_name"))
+        dom_headline = headline_from_dom(tree, site_name=site)
         if dom_headline:
             article.headline = dom_headline
             article.headline_source = Path.TRAFILATURA
@@ -139,6 +157,37 @@ def extract_article(
     # that extraction started too high in the DOM.
     article.body = _strip_leading_headline(article.body, article.headline)
     article.body_source = body_source if article.body else Path.NONE
+
+    # ---- headline sanity check ---------------------------------------
+    # A headline whose words appear nowhere in the body is not this article's
+    # headline. lung.org serves og:title "Press Releases | American Lung
+    # Association" on every individual release, with no og:site_name to strip
+    # it against - while the <h1> carries the real one.
+    #
+    # Decided on measured overlap rather than on a rule about which tag to
+    # trust, because "prefer the h1" is wrong just as often: plenty of sites
+    # put the section name in the h1 and the headline in og:title. Only a
+    # candidate that is both near-zero and clearly beaten is replaced.
+    if article.body and article.headline:
+        alternative = headline_from_dom(tree, site_name=site)
+        if alternative and alternative != article.headline:
+            current_score = _coherence(article.headline, article.body)
+            alt_score = _coherence(alternative, article.body)
+            # Near-zero on one side, and a real share of the candidate's own
+            # words present in the article's opening on the other. The floor is
+            # 0.3 rather than something higher because a correct headline is
+            # routinely paraphrased rather than repeated - the Valatie release
+            # scores 0.444 - while a wrong one (a section name, another
+            # story's title) sits at or near zero and cannot clear it.
+            if (current_score is not None and alt_score is not None
+                    and current_score <= 0.1 and alt_score >= 0.3):
+                article.quality["headline_replaced"] = (
+                    f"{article.headline_source.value} scored {current_score} "
+                    f"against the body; dom h1 scored {alt_score}")
+                article.headline = alternative
+                article.headline_source = Path.TRAFILATURA
+                # The body may now open with the headline we just adopted.
+                article.body = _strip_leading_headline(article.body, article.headline)
 
     # ---- date --------------------------------------------------------
     article.date = resolve_date(
@@ -228,16 +277,21 @@ def _headline_coherence(article: Article) -> float | None:
     article container - which returns a plausible-looking record that is simply
     about a different story.
     """
-    if not article.headline or not article.body:
+    return _coherence(article.headline, article.body)
+
+
+def _coherence(headline: str | None, body: str | None) -> float | None:
+    """Score one headline candidate against one body. See above."""
+    if not headline or not body:
         return None
     import re
 
     stop = {"the", "a", "an", "and", "or", "of", "to", "in", "for", "on", "at",
             "by", "with", "from", "as", "is", "are", "was", "were", "be", "its"}
-    words = {w for w in re.findall(r"\w+", article.headline.lower())
+    words = {w for w in re.findall(r"\w+", headline.lower())
              if len(w) > 2 and w not in stop}
     if not words:
         return None
-    lead = article.body[:1500].lower()
+    lead = body[:1500].lower()
     hits = sum(1 for w in words if w in lead)
     return round(hits / len(words), 3)

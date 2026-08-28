@@ -76,6 +76,13 @@ class Discovery:
     feed_url: str | None = None
     articles: list[ArticleRef] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Separate from `errors` because they are not failures: they are the
+    # cascade correctly declining a source that answers for the whole site
+    # while the target is one section of it. Filing them as errors made every
+    # healthy sectioned target report errors, which is how a run with nothing
+    # wrong ends up printing nine of them - and how an error list stops being
+    # read at all.
+    notes: list[str] = field(default_factory=list)
     # True when every feed path was probed and none existed. Cached so we stop
     # paying for the same nine 404s on every daily run.
     feed_absent: bool = False
@@ -223,6 +230,7 @@ async def find_feed(
     html: str | None = None,
     *,
     skip_probe: bool = False,
+    base_url: str | None = None,
 ) -> tuple[str | None, bool, bool]:
     """Find a feed. Returns (feed_url, probed_and_found_nothing, autodiscovered).
 
@@ -246,7 +254,7 @@ async def find_feed(
             ctype = (node.attributes.get("type") or "").lower()
             href = node.attributes.get("href")
             if href and ("rss" in ctype or "atom" in ctype or "xml" in ctype):
-                return canonical_url(urljoin(page_url, href)), False, True
+                return canonical_url(urljoin(base_url or page_url, href)), False, True
 
     if skip_probe:
         return None, False, False   # cached absence - do not re-probe, do not re-cache
@@ -266,7 +274,7 @@ async def from_feed(fetcher: PoliteFetcher, feed_url: str) -> Discovery:
         out.method = "none"
         out.errors.append(f"feed fetch failed: {resp.error or resp.status}")
         return out
-    out.articles = parse_feed(resp.text, feed_url)
+    out.articles = parse_feed(resp.text, resp.final_url or feed_url)
     if not out.articles:
         out.method = "none"
         out.errors.append("feed parsed but contained no items")
@@ -449,8 +457,18 @@ def _in_chrome(node) -> bool:
 # CAM: gathering all the anchor href links from a page and determining which ones are
 # the important ones
 def harvest_links(html: str, page_url: str, limit: int = 60,
-                  *, section: str | None = None) -> list[ArticleRef]:
+                  *, section: str | None = None,
+                  base_url: str | None = None) -> list[ArticleRef]:
     """Score every same-domain link and keep the article-shaped ones.
+
+    `base_url` is the URL the response actually came from, and relative hrefs
+    resolve against it - never against `page_url`, which is the canonicalised
+    URL we asked for. The two differ whenever a site redirects, and the
+    difference is not cosmetic: ccu.edu/news redirects to www.ccu.edu/news/,
+    and its links are relative with no leading slash ("2026/some-story/").
+    Resolving those against the slash-less canonical form makes urljoin treat
+    "news" as a file rather than a directory, so every article URL lost its
+    /news/ segment and 404ed - twelve fetches, twelve failures, no articles.
 
     A listing page links to everything on the site, so "same domain and
     article-shaped" is far too permissive on its own - battelle.org's
@@ -472,6 +490,7 @@ def harvest_links(html: str, page_url: str, limit: int = 60,
     """
     tree = LexborHTMLParser(html)
     domain = registrable_domain(page_url)
+    base = base_url or page_url
     # (score, url, in_chrome)
     scored: list[tuple[float, str, bool]] = []
     seen: set[str] = set()
@@ -480,7 +499,7 @@ def harvest_links(html: str, page_url: str, limit: int = 60,
         href = node.attributes.get("href") or ""
         if not href or href.startswith(("#", "mailto:", "javascript:", "tel:")):
             continue
-        absolute = canonical_url(urljoin(page_url, href))
+        absolute = canonical_url(urljoin(base, href))
         if not absolute or absolute in seen or absolute == canonical_url(page_url):
             continue
         if registrable_domain(absolute) != domain:
@@ -505,7 +524,8 @@ def harvest_links(html: str, page_url: str, limit: int = 60,
 
 
 async def from_listing(fetcher: PoliteFetcher, page_url: str, html: str | None = None,
-                       limit: int = 60, *, section: str | None = None) -> Discovery:
+                       limit: int = 60, *, section: str | None = None,
+                       base_url: str | None = None) -> Discovery:
     out = Discovery(method="listing")
     if html is None:
         resp = await fetcher.get(page_url)
@@ -514,7 +534,11 @@ async def from_listing(fetcher: PoliteFetcher, page_url: str, html: str | None =
             out.errors.append(f"listing fetch failed: {resp.error or resp.status}")
             return out
         html = resp.text
-    out.articles = harvest_links(html, page_url, limit=limit, section=section)
+        # Where the HTML actually came from, which is what relative links
+        # resolve against. A caller supplying `html` must supply this too.
+        base_url = resp.final_url or page_url
+    out.articles = harvest_links(html, page_url, limit=limit, section=section,
+                                 base_url=base_url)
     if not out.articles and section:
         # Nothing under the target's own section. Widening to the whole site
         # would just harvest the global nav, so report the honest answer.
@@ -548,7 +572,7 @@ def _root_feed_for_section(feed_url: str, section: str | None) -> bool:
 
 def _covers_target(found: Discovery, listing_html: str | None,
                         newsroom_url: str, section: str | None,
-                        declared: bool) -> bool:
+                        declared: bool, base_url: str | None = None) -> bool:
     """Is this source actually about the page we were asked to crawl?
 
     Applies to every source that lives at the site root - a probed feed, a CMS
@@ -578,7 +602,8 @@ def _covers_target(found: Discovery, listing_html: str | None,
     # exposes 120 links, of which 6 are its own and the rest are social and
     # portal links to other domains entirely.
     target_domain = registrable_domain(newsroom_url)
-    page_links = {canonical_url(urljoin(newsroom_url, a.attributes.get("href") or ""))
+    base = base_url or newsroom_url
+    page_links = {canonical_url(urljoin(base, a.attributes.get("href") or ""))
                   for a in LexborHTMLParser(listing_html).css("a[href]")}
     page_links = {u for u in page_links
                   if u and registrable_domain(u) == target_domain}
@@ -622,6 +647,14 @@ async def discover(
     # Assigned by the listing fast path when it runs, so the full cascade below
     # reuses that response instead of fetching the same page twice.
     listing_html: str | None = None
+    # The URL that HTML actually came from. Relative links resolve against this,
+    # never against `newsroom_url` - see harvest_links for what that cost.
+    listing_url: str = newsroom_url
+    # Set once the newsroom page has been requested, so a fast path that tried
+    # it and failed does not make the cascade pay for the same refusal twice.
+    listing_fetched: bool = False
+    # Why it is not in hand, when it is not. See the cascade's fetch below.
+    listing_error: str | None = None
 
     def usable(found: Discovery) -> bool:
         """Did this method find anything the crawl would actually keep?
@@ -652,7 +685,7 @@ async def discover(
         # small result set should not be condemned by a single stray. The floor
         # keeps a 2-of-3 sample from tripping it.
         if total >= MIN_RESULTS_FOR_RATIO and len(found.articles) / total < MIN_OWN_CONTENT:
-            found.errors.append(
+            found.notes.append(
                 f"ignoring {found.method}: {dropped} of {total} results are not "
                 f"{target_domain}")
             return False
@@ -691,28 +724,44 @@ async def discover(
         # this branch a listing target re-walked the sitemap index on every
         # single run, having already established the sitemap does not cover it.
         resp = await fetcher.get(newsroom_url)
+        listing_fetched = True
         if resp.ok:
             listing_html = resp.text
+            listing_url = resp.final_url or newsroom_url
             found = await from_listing(fetcher, newsroom_url, listing_html,
-                                       limit=limit, section=section)
+                                       limit=limit, section=section,
+                                       base_url=listing_url)
             if usable(found):
                 return found
         elif resp.wall:
             out = Discovery(method="none")
             out.errors.append(f"bot wall: {resp.wall}")
             return out
+        else:
+            listing_error = f"newsroom page: {resp.error or f'HTTP {resp.status}'}"
     # Anything that falls through here re-runs the full cascade, which is what
     # should happen when a site changes CMS or moves its feed.
 
-    probe_errors: list[str] = []
-    if listing_html is None:
+    probe_notes: list[str] = []
+    # Why the target's own page is not in hand, when it is not. The listing page
+    # is only one of four sources, so its failure is not fatal - a sitemap may
+    # still answer - but it has to be reported. lawsociety.org.uk returns a
+    # branded 403 ("403 - The Law Society"), which is not a solvable challenge
+    # and so is correctly not a bot wall; discovery then ran the whole cascade
+    # against a site refusing us and concluded "all discovery methods failed".
+    # True, and useless: it names the symptom and hides the cause.
+    if listing_html is None and not listing_fetched:
         resp = await fetcher.get(newsroom_url)
         if resp.ok:
             listing_html = resp.text
+            listing_url = resp.final_url or newsroom_url
         elif resp.wall:
             out = Discovery(method="none")
             out.errors.append(f"bot wall: {resp.wall}")
             return out
+        else:
+            listing_error = (f"newsroom page: "
+                             f"{resp.error or f'HTTP {resp.status}'}")
 
     # 1. WordPress REST - one request for headline + body + exact date.
     #    Corroborated like any other site-root source: `/wp-json/wp/v2/posts`
@@ -722,9 +771,10 @@ async def discover(
     if listing_html and ("/wp-content/" in listing_html or "/wp-json" in listing_html):
         found = await from_wp_json(fetcher, base, limit=limit)
         if usable(found):
-            if _covers_target(found, listing_html, newsroom_url, section, False):
+            if _covers_target(found, listing_html, newsroom_url, section, False,
+                              base_url=listing_url):
                 return found
-            probe_errors.append(
+            probe_notes.append(
                 f"ignoring site-wide CMS API: none of its posts appear under {section}")
 
     # 2. Feeds. Autodiscovery always runs; path probing is skipped when a
@@ -734,24 +784,25 @@ async def discover(
     # still runs, since it is free and a declared feed outranks a probed one.
     feed_url, probed_empty, declared = await find_feed(
         fetcher, newsroom_url, listing_html,
-        skip_probe=feed_absent or bool(known_feed))
+        skip_probe=feed_absent or bool(known_feed), base_url=listing_url)
     if feed_url is None and known_feed and known_method == "rss":
         feed_url, declared = known_feed, False
     if feed_url:
         found = await from_feed(fetcher, feed_url)
         if usable(found) and _covers_target(
-                found, listing_html, newsroom_url, section, declared):
+                found, listing_html, newsroom_url, section, declared,
+                base_url=listing_url):
             return found
         if usable(found):
             out_note = (f"ignoring site-wide feed {feed_url}: none of its items "
                         f"appear under {section}")
-            probe_errors.append(out_note)
+            probe_notes.append(out_note)
 
     # 3. Sitemaps.
     found = await from_sitemap(fetcher, base, limit=limit, section=section)
     if usable(found) and (found.scoped or not section):
         found.feed_absent = probed_empty
-        found.errors.extend(probe_errors)
+        found.notes.extend(probe_notes)
         return found
 
     # A sitemap that could not be scoped to the target's section is held in
@@ -759,24 +810,27 @@ async def discover(
     # explicit statement of what belongs in this section - outranks it.
     unscoped_sitemap = found if usable(found) else None
     if unscoped_sitemap is not None:
-        probe_errors.append(
+        probe_notes.append(
             f"sitemap matched nothing under {section}; preferring the listing page")
 
     # 4. Listing page.
     if listing_html:
         found = await from_listing(fetcher, newsroom_url, listing_html,
-                                   limit=limit, section=section)
+                                   limit=limit, section=section,
+                                   base_url=listing_url)
         found.feed_absent = probed_empty
-        found.errors.extend(probe_errors)
+        found.notes.extend(probe_notes)
         if usable(found):
             return found
 
     if unscoped_sitemap is not None:
         unscoped_sitemap.feed_absent = probed_empty
-        unscoped_sitemap.errors.extend(probe_errors)
+        unscoped_sitemap.notes.extend(probe_notes)
         return unscoped_sitemap
 
     out = Discovery(method="none", feed_absent=probed_empty)
-    out.errors.extend(probe_errors)
+    out.notes.extend(probe_notes)
+    if listing_error:
+        out.errors.append(listing_error)
     out.errors.append("all discovery methods failed")
     return out

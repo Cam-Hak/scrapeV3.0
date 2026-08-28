@@ -37,7 +37,7 @@ import random
 import socket
 import time
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from curl_cffi.requests import AsyncSession
 
@@ -92,6 +92,11 @@ class _HostState:
     latencies: list[float] = field(default_factory=list)
     consec_failures: int = 0
     blocked_until: float = 0.0        # circuit breaker
+    # What opened the breaker. Without it the breaker hides the very thing it
+    # is reacting to: a run reported "circuit-open x11" and nothing else,
+    # because the failures that tripped it happened during discovery and the
+    # article fetches that followed only ever saw the open circuit.
+    blocked_reason: str | None = None
 
     def observe_latency(self, seconds: float) -> None:
         self.latencies.append(seconds)
@@ -105,10 +110,64 @@ class _HostState:
         return ordered[len(ordered) // 2]
 
 
+# Failures where no server ever answered, so there is nothing to conclude about
+# the URL itself - only about the host name. Formatted by _raw_get as
+# "{type(exc).__name__}: {exc}".
+_NO_SERVER_ERRORS = ("DNSError", "SSLError", "ConnectionError", "ConnectTimeout")
+
+
+def _with_www(url: str) -> str | None:
+    """The same URL on the `www.` host, or None if there is no such variant.
+
+    Deliberately not restricted to apex hosts. `law.georgetown.edu` does not
+    resolve while `www.law.georgetown.edu` does, so a subdomain needs this
+    exactly as much as `ardian.com` does - the caller's gate is "no server ever
+    answered", and against a host that is already answering this is never
+    reached. Shape of the hostname is not evidence about what resolves.
+    """
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if not host or host.startswith("www."):
+        return None
+    return urlunsplit((parts.scheme, f"www.{parts.netloc}", parts.path,
+                       parts.query, parts.fragment))
+
+
+# Challenge pages that return HTTP 200 with a script where the content should
+# be. The <title> tell does not fire on these: justice.gov serves 2.6 KB
+# containing triggerInterstitialChallenge() and no text at all, which read as
+# "needs_browser: low text yield" - so every article was queued for a browser
+# that would meet the same challenge, and the host was never backed off from.
+# These are vendor fingerprints, not per-site knowledge.
+CHALLENGE_MARKERS = (
+    "triggerinterstitialchallenge",                   # Akamai Bot Manager
+    "_cf_chl_opt", "__cf_chl", "challenge-platform",  # Cloudflare
+    "_incapsula_resource",                            # Imperva
+    "awswaf",                                         # AWS WAF
+    "_pxhd", "px-captcha",                            # PerimeterX
+    "kpsdk",                                          # Kasada
+)
+# Above this the page carries real content, and any such string in it is
+# incidental - an article about bot protection is still an article.
+CHALLENGE_MAX_BYTES = 8192
+
+
 def detect_wall(html: str) -> str | None:
-    """Return the matched marker if the page looks like a challenge page."""
+    """Return the matched marker if the page looks like a challenge page.
+
+    Two tells, because a wall arrives two ways: as a rendered notice whose
+    <title> says so, and as a bare script that would run in a browser. Both
+    return HTTP 200 with plausible bytes, which is why status codes miss them.
+    """
     if not html:
         return None
+
+    if len(html) <= CHALLENGE_MAX_BYTES:
+        small = html.lower()
+        for marker in CHALLENGE_MARKERS:
+            if marker in small:
+                return f"js challenge ({marker})"
+
     lowered = html[:4096].lower()
     start = lowered.find("<title")
     if start == -1:
@@ -176,6 +235,10 @@ class PoliteFetcher:
             # nothing to multiplex; the value is amortizing one TLS handshake
             # across a lease's burst of article fetches.
             allow_redirects=True,
+            # Redirects are followed inside curl, so they bypass per-host
+            # pacing entirely. Capped well below curl's default of 30 to bound
+            # what one misconfigured site can extract from us in a single get().
+            max_redirects=self.settings.politeness.max_redirects,
         )
         return self
 
@@ -281,6 +344,16 @@ class PoliteFetcher:
                         r = await self._session.get(url, headers=headers)
                 except Exception as exc:                      # noqa: BLE001
                     state.consec_failures += 1
+                    # Same verdict as a run of 403s, reached a different way: a
+                    # host failing every request at the transport layer is not
+                    # going to serve the next one either. ersnet.org 301s a
+                    # section to itself forever, so ten article fetches each
+                    # burned the full redirect budget before failing.
+                    pol = self.settings.politeness
+                    if state.consec_failures >= pol.max_consec_refusals:
+                        state.blocked_until = time.monotonic() + pol.refusal_cooldown_s
+                        state.blocked_reason = (
+                            f"{state.consec_failures}x {type(exc).__name__}")
                     return Response(url=url, final_url=url, status=0, text="",
                                     headers={}, elapsed_s=time.monotonic() - started,
                                     error=f"{type(exc).__name__}: {exc}")
@@ -321,16 +394,27 @@ class PoliteFetcher:
                 except ValueError:
                     wait = 60.0        # HTTP-date form; 60s is a safe floor
             state.blocked_until = time.monotonic() + min(wait, 3600.0)
+            state.blocked_reason = f"HTTP {resp.status}"
             state.delay_s = min((state.delay_s or pol.default_delay_s) * 2, 300.0)
             state.consec_failures += 1
             return
 
         if resp.status == 403 or resp.wall:
             state.consec_failures += 1
+            # A run of refusals is a verdict, not a transient fault. Without
+            # this the crawler kept asking: news.csub.edu refused fourteen
+            # consecutive article fetches in one pass, each after the full
+            # per-host delay, and would have done so again on every daily run.
+            if state.consec_failures >= pol.max_consec_refusals:
+                state.blocked_until = time.monotonic() + pol.refusal_cooldown_s
+                state.blocked_reason = (
+                    f"{state.consec_failures}x "
+                    f"{resp.wall and 'bot wall' or f'HTTP {resp.status}'}")
             return
 
         if resp.ok or resp.from_cache:
             state.consec_failures = 0
+            state.blocked_reason = None
             # Latency-adaptive backoff, in both directions.
             p50 = state.p50()
             if p50 and resp.elapsed_s > p50 * pol.latency_backoff_multiple:
@@ -347,14 +431,51 @@ class PoliteFetcher:
         etag: str | None = None,
         last_modified: str | None = None,
     ) -> Response:
-        """Fetch a URL politely, honoring robots.txt and per-host pacing."""
+        """Fetch a URL politely, honoring robots.txt and per-host pacing.
+
+        Falls back to the `www.` host when the bare one never reached a server.
+        Canonicalisation strips `www.`, which is right for identity - one
+        article should not be two records because it was linked both ways - but
+        it is not an assertion that the apex host serves anything. Two of the
+        ten domains in one run were unreachable for exactly that reason:
+        `ardian.com` has no A record at all, and `escardio.org` resolves to a
+        different host than `www.escardio.org` and fails TLS there.
+
+        Retried only on DNS/TLS/connection failure - i.e. when no server ever
+        answered - so a genuine 404 or 403 is never re-requested, and a working
+        host never pays for this. The retry runs the robots check again for the
+        new origin and takes the same per-host lock and delay, so it is exactly
+        as polite as the request it replaces.
+        """
+        resp = await self._get_once(url, check_robots=check_robots,
+                                    etag=etag, last_modified=last_modified)
+        if resp.error and resp.error.startswith(_NO_SERVER_ERRORS):
+            alternative = _with_www(url)
+            if alternative is not None:
+                retried = await self._get_once(alternative, check_robots=check_robots,
+                                               etag=etag, last_modified=last_modified)
+                if retried.ok:
+                    return retried
+        return resp
+
+    async def _get_once(
+        self,
+        url: str,
+        *,
+        check_robots: bool = True,
+        etag: str | None = None,
+        last_modified: str | None = None,
+    ) -> Response:
+        """One attempt: circuit breaker, robots, pacing, fetch."""
         domain = registrable_domain(url)
         state = self._host_state(domain)
 
         now = time.monotonic()
         if now < state.blocked_until:
+            because = f" after {state.blocked_reason}" if state.blocked_reason else ""
             return Response(url=url, final_url=url, status=0, text="", headers={},
-                            elapsed_s=0.0, error="circuit-open: host backing off")
+                            elapsed_s=0.0,
+                            error=f"circuit-open: host backing off{because}")
 
         if check_robots:
             rules = await self.robots_for(url)

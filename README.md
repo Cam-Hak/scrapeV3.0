@@ -206,6 +206,54 @@ than trusted, and each now has a regression test.
 | **A site-wide source outranked the target's own section** | `fightcancer.org/press-room/search` collected ten advocacy actions and events instead of its ten press releases, and reported success | Three sources could each fall back to "the whole site" and win. See below |
 | **Slug threshold too strict** | Real articles like `/news/rewriting-story-metal` were rejected | Threshold lowered from 4 words to 3, which still separates them from 1-2 word section indexes |
 
+### What ten consecutive 10-domain runs exposed
+
+The first run of `crawl --domains 10 --max-articles 5` reported **15 failed**
+with no reason recorded anywhere, plus nine "errors" of which eight were the
+cascade working correctly. Ten runs later the same command reports **zero
+errors and zero failures**. The individual bugs matter less than the pattern:
+*every one of them was invisible in the output before it was fixed*, and the
+first work of each round was making the run say what it had actually done.
+
+| Bug | Impact | Fix |
+|---|---|---|
+| **Relative links resolved against the wrong base** | `ccu.edu/news` redirects to `www.ccu.edu/news/`, and its links are relative with no leading slash. Resolving them against the canonical URL — whose trailing slash canonicalisation had stripped — made `urljoin` treat `news` as a file, so every article URL lost its `/news/` segment. Twelve fetches, twelve 404s, zero articles, and the frontier recorded the domain as successfully crawled | Relative hrefs resolve against `resp.final_url`, never the requested URL. Six call sites: `harvest_links`, `from_listing`, `find_feed`, `from_feed`, `_covers_target`, and the audit's `page_links`. The corroboration gate had it too, so it was building its comparison set from URLs that exist nowhere and then reporting `no_overlap` — discovery blamed for a join bug |
+| **`www.` stripped from the fetch URL** | Canonicalisation drops `www.`, which is right for identity and is not an assertion that the apex host serves anything. `ardian.com` has no A record at all; `escardio.org` resolves to a different host than `www.escardio.org` and fails TLS there; `law.georgetown.edu` does not resolve while `www.law.georgetown.edu` does | `get()` retries on the `www.` host, gated on DNS/TLS/connection failure — only when no server ever answered, so a real 404 is never re-requested. Not restricted to apex hosts: the shape of a hostname is not evidence about what resolves |
+| **Redirects bypassed per-host pacing entirely** | `ersnet.org` 301s `/news-and-features/news/` to itself forever. curl follows redirects *internally*, so they never reach `_wait_turn` — at curl's default of 30 hops, ten article fetches became ~300 back-to-back unpaced requests to one host. No per-host delay could see it, because the delay is applied per `get()` call | `max_redirects` capped at 5, and the circuit breaker extended to transport failures: `_raw_get`'s exception path incremented `consec_failures` but returned before `_apply_backoff` ran, so repeated timeouts and redirect loops never backed off. Measured on that domain, ~300 requests down to 25 |
+| **Refusals were paid for in full, every run** | `news.csub.edu` served a Cloudflare 403 to fourteen consecutive article fetches in one pass, each after the full per-host delay. The breaker existed but only opened on 429/503 | Opens after `SCRAPEV3_MAX_CONSEC_REFUSALS` consecutive refusals. A run of them is a verdict, not a transient fault |
+| **Headline chrome stripped only from `<title>`** | `centerforfoodsafety.org` stored `Center for Food Safety \| Press Releases \| \| Lawsuit Filed...`. The fix for that exact string already existed, but ran only on the `<title>` path — and this site serves the same chrome in `og:title` | `strip_title_chrome` runs on every headline candidate. Deliberately conservative: a value with no recognised chrome is returned untouched, so an ordinary headline containing a dash is never truncated |
+| **A headline belonging to a different page** | `lung.org` serves an `og:title` of `Press Releases \| American Lung Association` on every individual release. `headline_in_body` was **0.0** — the strongest available signal that the headline is not this article's | Decided on measured overlap, not on a rule about which tag to trust: near-zero coherence plus a materially better DOM `h1` swaps it, recorded in `quality.headline_replaced`. "Prefer the h1" is wrong just as often, and a test pins the case where the h1 is the section name and must not win |
+| **The site name leaked into the headline** | Same site, no `og:site_name` to strip against, so releases stored `... \| American Lung Association` — which flows through to `press_release.headline` and the `$H` filename | The `<title>` gives it away: a CMS appending the site name to a title that already ends in it produces `Headline \| Site \| Site`. Only that doubling licenses the inference. Assuming the last segment of any title is the site name would truncate every real headline containing a dash |
+
+**The diagnostics were the actual deliverable.** Four of the ten rounds were
+spent making failures legible rather than changing crawler behaviour, and each
+one immediately exposed a bug that had been running unnoticed.
+
+| Before | After | What it found |
+|---|---|---|
+| `failed: 15` | `Why fetches failed`, by reason and by domain | `HTTP 403 x14` on one host, `TooManyRedirects` on another. A reason without attribution is half a diagnosis: `HTTP 404 x20` from one domain is a URL-construction bug, from twenty domains it is nothing at all |
+| `unusable: 7` | `Why articles were unusable` | `body under 300 chars` and `body looks like page chrome` are different problems with the same count. `Article.usable` is now derived from `unusable_reason`, so the two cannot drift apart |
+| Nine "errors" on a clean run | `errors` and `notes` on separate channels | A declined site-wide source is the cascade working. An error list that fills up on healthy runs is an error list nobody reads |
+| Articles vanishing between `discovered` and `stored` | `older than the window` counted | 174 discovered, 36 stored and every rejection row zero looks broken. The honest answer was the age cutoff |
+| `all discovery methods failed` | The status that caused it | `lawsociety.org.uk` returns a branded `403 - The Law Society`. That is a refusal, not a solvable challenge, so it is correctly not a bot wall — and the cascade ran every source against a site refusing us, then named the symptom and hid the cause |
+| `circuit-open: host backing off x11` | `...after 5x TooManyRedirects` | A defect introduced by the breaker itself. The failures that tripped it happened during discovery, which does not feed the crawl's tally, so every article fetch afterwards saw only an open circuit — one silent failure replaced by another |
+
+**What deliberately did not change.** `is_non_news_path` matches whole path
+segments, so it does not catch `/live-online-courses/`. Extending it to
+hyphenated compounds would also veto real press releases whose slug ends in
+`-programs` or `-courses` — the per-site over-fitting this rewrite exists to
+end. `classify_url` already rejects those URLs, so the gap costs nothing.
+
+**Some errors are not bugs and will never reach zero.** `dol.gov`, `faa.gov`,
+`cargill.com` and `stfx.ca` serve genuine bot walls; `um.edu.mo` returned 503.
+Those are sites declining an identified crawler, which is their call. The bar
+is that every remaining line is a true statement about the site rather than a
+defect on our side.
+
+Final corpus over those ten runs: **322 unique articles from 77 domains**,
+median `prose_ratio` **0.848** with none below 0.30, median body 3,520
+characters, and **zero** rows missing a date or a headline.
+
 ### When a whole-site source wins over the target's own section
 
 The worst bug found so far, because nothing about it looked like a bug.

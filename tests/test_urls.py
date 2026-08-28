@@ -335,3 +335,42 @@ class TestDateArchiveIsNotAnArticleId:
         assert classify_url("https://x.org/news/2026/08/26/mayor-announces-plan").is_article
         assert classify_url(
             "https://hccs.edu/news/2026/april/us-economic-future-depends-on-work").is_article
+
+
+class TestMediaSectionsAreNotTextNews:
+    """justice.gov's press feed carries /archives/opa/video/... entries.
+
+    Feeds bypass the URL classifier - they are trusted because they only
+    publish articles - so the non-news veto is the only gate that sees them,
+    and it had no notion of video. Ten fetches returned 2.6 KB of HTML and zero
+    body text, then each was flagged `needs_browser` on a page that will never
+    have text to render.
+    """
+
+    def test_media_sections_are_vetoed(self):
+        from scrapev3.urls import is_non_news_path
+
+        assert is_non_news_path("https://justice.gov/archives/opa/video/ag-statement")
+        assert is_non_news_path("https://example.org/news/gallery/summit-photos")
+        assert is_non_news_path("https://example.org/podcast/episode-42-housing")
+        assert is_non_news_path("https://example.org/webcast/quarterly-briefing")
+
+    def test_a_slug_that_merely_mentions_media_survives(self):
+        """The veto matches whole path segments. A real press release about
+        video conferencing, or one whose slug names photographers, is news -
+        and matching substrings would be the per-site over-fitting this
+        project exists to end."""
+        from scrapev3.urls import is_non_news_path
+
+        assert not is_non_news_path(
+            "https://example.org/news/video-conferencing-standard-approved")
+        assert not is_non_news_path(
+            "https://example.org/press-releases/photographers-win-major-award")
+
+    def test_a_media_section_that_is_the_newsroom_survives(self):
+        """Plenty of institutions put press releases under /media/. That is a
+        news segment, not a media-asset section, and it must not be vetoed."""
+        from scrapev3.urls import is_non_news_path
+
+        assert not is_non_news_path(
+            "https://example.org/media/press-releases/new-rules-announced")

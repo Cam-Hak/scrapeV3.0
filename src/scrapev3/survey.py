@@ -247,6 +247,9 @@ async def probe_domain(fetcher: PoliteFetcher, site: Site) -> DomainSurvey:
         return s
 
     tree = LexborHTMLParser(resp.text) if resp.text else None
+    # Relative hrefs resolve against the response's own URL, not the one we
+    # asked for; the two differ on every site that redirects.
+    page_base = resp.final_url or site.newsroom_url
 
     # --- CMS fingerprint ----------------------------------------------
     if tree is not None:
@@ -263,7 +266,7 @@ async def probe_domain(fetcher: PoliteFetcher, site: Site) -> DomainSurvey:
             if "rss" in t or "atom" in t or "xml" in t:
                 href = node.attributes.get("href")
                 if href:
-                    s.feed_url = canonical_url(urljoin(site.newsroom_url, href))
+                    s.feed_url = canonical_url(urljoin(page_base, href))
                     s.feed_source = "autodiscovery"
                     break
 
@@ -332,7 +335,7 @@ async def probe_domain(fetcher: PoliteFetcher, site: Site) -> DomainSurvey:
             href = a.attributes.get("href") or ""
             if not href or href.startswith(("#", "mailto:", "javascript:", "tel:")):
                 continue
-            absolute = canonical_url(urljoin(site.newsroom_url, href))
+            absolute = canonical_url(urljoin(page_base, href))
             if not absolute or absolute in seen:
                 continue
             # Same registrable domain only - listing pages link out constantly.

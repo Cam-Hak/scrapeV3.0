@@ -74,9 +74,23 @@ class Article:
         The prose check is what stops a successful-looking extraction of the
         nav sidebar from being written as an article.
         """
-        return (
-            bool(self.headline)
-            and self.body_len >= 300
-            and self.date.value is not None
-            and not self.quality.get("looks_like_navigation", False)
-        )
+        return self.unusable_reason is None
+
+    @property
+    def unusable_reason(self) -> str | None:
+        """Which requirement failed, or None when the article is storable.
+
+        A bare count of "unusable" is not a diagnosis: seven articles with no
+        date and seven whose body came back as the nav menu are the same number
+        and completely different problems - the first is a date-extraction gap,
+        the second is extraction reading the wrong subtree.
+        """
+        if not self.headline:
+            return "no headline"
+        if self.body_len < 300:
+            return "body under 300 chars"
+        if self.date.value is None:
+            return "no date"
+        if self.quality.get("looks_like_navigation", False):
+            return "body looks like page chrome"
+        return None

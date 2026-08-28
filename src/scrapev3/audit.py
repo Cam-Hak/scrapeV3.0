@@ -98,6 +98,10 @@ class TargetAudit:
     findings: list[Finding] = field(default_factory=list)
     sample: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Kept apart from errors for the same reason the crawler keeps them apart:
+    # a declined site-wide source is the cascade working, and an audit row that
+    # files it under "errors" reads as a broken target.
+    notes: list[str] = field(default_factory=list)
 
     @property
     def score(self) -> int:
@@ -127,7 +131,7 @@ class TargetAudit:
         return d
 
 
-def page_links(html: str, page_url: str) -> set[str]:
+def page_links(html: str, page_url: str, base_url: str | None = None) -> set[str]:
     """Every same-site link on the page, canonicalised.
 
     Deliberately *not* filtered to article-shaped links: this is the
@@ -136,11 +140,17 @@ def page_links(html: str, page_url: str) -> set[str]:
     """
     out: set[str] = set()
     domain = registrable_domain(page_url)
+    # Relative hrefs resolve against where the response came from, not against
+    # the canonicalised URL we asked for. On a site that redirects (and whose
+    # canonical form has lost its trailing slash) the two resolve differently,
+    # and the corroboration set ends up full of URLs that exist nowhere - which
+    # reads downstream as `no_overlap`, i.e. discovery blamed for a join bug.
+    base = base_url or page_url
     for node in LexborHTMLParser(html).css("a[href]"):
         href = node.attributes.get("href") or ""
         if not href or href.startswith(("#", "mailto:", "javascript:", "tel:")):
             continue
-        absolute = canonical_url(urljoin(page_url, href))
+        absolute = canonical_url(urljoin(base, href))
         if absolute and registrable_domain(absolute) == domain:
             out.add(absolute)
     return out
@@ -247,7 +257,8 @@ async def audit_target(fetcher: PoliteFetcher, *, a_id: int, domain: str,
     links: set[str] = set()
     if resp.ok:
         try:
-            links = page_links(resp.text, newsroom_url)
+            links = page_links(resp.text, newsroom_url,
+                               base_url=resp.final_url or newsroom_url)
         except Exception as exc:                            # noqa: BLE001
             a.errors.append(f"page parse failed: {type(exc).__name__}")
     elif resp.wall:
@@ -271,6 +282,7 @@ async def audit_target(fetcher: PoliteFetcher, *, a_id: int, domain: str,
     a.source_url = found.feed_url
     a.scoped = found.scoped
     a.errors.extend(found.errors)
+    a.notes.extend(found.notes)
 
     urls = [canonical_url(r.url) for r in found.articles]
     a.n_articles = len(urls)

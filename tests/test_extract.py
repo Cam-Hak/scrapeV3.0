@@ -21,6 +21,8 @@ from scrapev3.extract import (
     extract_meta,
     headline_from_dom,
     headline_from_title,
+    strip_title_chrome,
+    site_name_from_title,
     looks_like_navigation,
     prose_ratio,
     parse_date_string,
@@ -568,3 +570,198 @@ class TestProseRatioSurvivesATrailingList:
         assert best_prose_ratio(None) == 0.0
         assert best_prose_ratio("") == 0.0
         assert looks_like_navigation(None)
+
+
+class TestHeadlineChromeOnEveryPath:
+    """Chrome stripping used to run only on <title>, so chrome arriving via
+    og:title was stored verbatim.
+
+    Both shapes were found in one live crawl. centerforfoodsafety.org serves
+    "Site | Section | | Headline" in og:title; lung.org serves
+    "Press Releases | American Lung Association" - the section's name, on every
+    individual release, with no og:site_name to strip it against.
+    """
+
+    def test_an_ordinary_headline_is_never_touched(self):
+        """The conservative half of the rule. A headline containing a dash
+        must survive intact - splitting and keeping the longest piece would
+        silently truncate real headlines, which is worse than the bug."""
+        value = "Mayor announces transit plan - and it is bigger than expected"
+        assert strip_title_chrome(value, "Example Times") == value
+
+    def test_chrome_around_a_real_headline_is_removed(self):
+        assert strip_title_chrome(
+            "Center for Food Safety | Press Releases |  | Lawsuit Filed to Stop Pollution",
+            "Center for Food Safety",
+        ) == "Lawsuit Filed to Stop Pollution"
+
+    def test_an_all_chrome_candidate_returns_none(self):
+        """None means "skip this source", not "use this string" - the caller
+        falls through to the next headline source rather than storing the
+        section name as the article's title."""
+        assert strip_title_chrome("Press Releases | American Lung Association",
+                                  "American Lung Association") is None
+
+    def test_no_separator_is_returned_whole(self):
+        assert strip_title_chrome("A perfectly ordinary headline") == \
+            "A perfectly ordinary headline"
+
+
+class TestHeadlineIsCheckedAgainstTheBody:
+    """The lung.org failure: og:title is the section name, there is no
+    og:site_name to recognise it by, and the <h1> holds the real headline.
+
+    Resolved on measured overlap rather than a rule about which tag to trust,
+    because "prefer the h1" is wrong just as often - plenty of sites put the
+    section in the h1 and the headline in og:title.
+    """
+
+    BODY = ("ALBANY, NY | August 18, 2026 The Village of Valatie is now home to "
+            "tobacco-free parks following the Village Board of Trustees unanimous "
+            "approval of a new policy. The playgrounds and parks will support a "
+            "healthier community for families across the region, and local "
+            "leaders say the change creates lasting benefits.")
+
+    def _page(self, og_title: str, h1: str) -> str:
+        return f"""<html><head>
+            <meta property="og:title" content="{og_title}">
+            </head><body><h1>{h1}</h1><article><p>{self.BODY}</p></article>
+            </body></html>"""
+
+    def test_a_headline_with_no_overlap_is_replaced_by_the_h1(self):
+        html = self._page("Press Releases | American Lung Association",
+                          "Village of Valatie Creates Healthy Playgrounds and Parks")
+        article = extract_article(html, "https://lung.org/media/press-releases/x")
+        assert article.headline.startswith("Village of Valatie")
+        assert "headline_replaced" in article.quality
+
+    def test_a_coherent_headline_is_left_alone(self):
+        """The guard that keeps this from becoming "always prefer the h1"."""
+        html = self._page("Village of Valatie Creates Healthy Playgrounds and Parks",
+                          "Press Releases")
+        article = extract_article(html, "https://lung.org/media/press-releases/x")
+        assert article.headline.startswith("Village of Valatie")
+        assert "headline_replaced" not in article.quality
+
+
+class TestUnusableSaysWhy:
+    """"unusable: 7" is a count, not a diagnosis.
+
+    Seven articles with no date and seven whose body came back as the nav menu
+    are the same number and completely different problems - one is a gap in
+    date extraction, the other is extraction reading the wrong subtree. The
+    reason is now carried on the article and tallied by the crawl.
+    """
+
+    def _article(self, **over):
+        from scrapev3.extract.models import Article, DateResult
+        from datetime import datetime
+
+        a = Article(url="https://example.org/a")
+        a.headline = over.get("headline", "A perfectly ordinary headline")
+        a.body = over.get("body", "word " * 200)
+        a.date = DateResult(value=over.get("date", datetime(2026, 8, 20)))
+        if over.get("nav"):
+            a.quality["looks_like_navigation"] = True
+        return a
+
+    def test_a_complete_article_has_no_reason(self):
+        a = self._article()
+        assert a.usable and a.unusable_reason is None
+
+    def test_each_requirement_names_itself(self):
+        assert self._article(headline=None).unusable_reason == "no headline"
+        assert self._article(body="short").unusable_reason == "body under 300 chars"
+        assert self._article(date=None).unusable_reason == "no date"
+        assert self._article(nav=True).unusable_reason == "body looks like page chrome"
+
+    def test_usable_still_agrees_with_the_reason(self):
+        """usable is now derived from unusable_reason, so the two cannot drift
+        apart the way two separate condition lists would."""
+        for over in ({"headline": None}, {"body": "x"}, {"date": None}, {"nav": True}):
+            a = self._article(**over)
+            assert not a.usable and a.unusable_reason is not None
+
+
+class TestSiteNameInferredFromADoubledTitle:
+    """lung.org offers no og:site_name, so there was nothing to strip its own
+    name against and it landed in the stored headline - and from there into
+    press_release.headline and the $H filename.
+
+    The evidence is the <title>: a CMS appending the site name to a title that
+    already ended in it produces "Headline | Site | Site". Only that doubling
+    licenses the inference; guessing that the last segment of any title is the
+    site name would truncate every real headline containing a dash.
+    """
+
+    def test_a_doubled_tail_names_the_site(self):
+        assert site_name_from_title(
+            "Thousands Across America Lace Up to End Lung Cancer "
+            "| American Lung Association | American Lung Association"
+        ) == "American Lung Association"
+
+    def test_an_ordinary_title_infers_nothing(self):
+        assert site_name_from_title("Council approves the budget | Example Times") is None
+        assert site_name_from_title("A headline with no separator at all") is None
+
+    def test_a_repeated_word_that_is_not_the_tail_infers_nothing(self):
+        assert site_name_from_title("News | Example Times | Council approves it") is None
+
+    def test_the_inferred_name_is_then_stripped(self):
+        """End to end: no og:site_name, and the headline still comes out clean."""
+        html = """<html><head>
+            <title>Thousands Lace Up to End Lung Cancer | American Lung Association | American Lung Association</title>
+            <meta property="og:title" content="Thousands Lace Up to End Lung Cancer | American Lung Association">
+            </head><body><h1>Thousands Lace Up to End Lung Cancer</h1>
+            <article><p>%s</p></article></body></html>""" % ("Runners gathered across the country " * 30)
+        article = extract_article(html, "https://lung.org/media/press-releases/x")
+        assert article.headline == "Thousands Lace Up to End Lung Cancer"
+
+
+class TestFailuresAreAttributed:
+    """A reason without attribution is half a diagnosis.
+
+    One run reported "HTTP 404 x20" and there was no way to tell whether that
+    was one site whose discovery builds URLs that do not exist - the ccu.edu
+    shape, a real bug - or twenty sites that had each deleted one article,
+    which is nothing at all. Those need opposite responses.
+    """
+
+    def test_the_tally_records_which_domains_contributed(self):
+        from scrapev3.crawl import CrawlStats
+
+        stats = CrawlStats()
+        stats.bump(stats.by_failure, "HTTP 404")
+        stats.failure_domains.setdefault("HTTP 404", set()).add("example.org")
+        stats.bump(stats.by_failure, "HTTP 404")
+        stats.failure_domains.setdefault("HTTP 404", set()).add("other.org")
+
+        assert stats.by_failure["HTTP 404"] == 2
+        assert stats.failure_domains["HTTP 404"] == {"example.org", "other.org"}
+
+    def test_reasons_do_not_share_a_domain_set(self):
+        from scrapev3.crawl import CrawlStats
+
+        stats = CrawlStats()
+        stats.failure_domains.setdefault("HTTP 404", set()).add("a.org")
+        stats.failure_domains.setdefault("HTTP 403", set()).add("b.org")
+        assert stats.failure_domains["HTTP 404"] == {"a.org"}
+        assert stats.failure_domains["HTTP 403"] == {"b.org"}
+
+
+class TestRobotsComplianceIsNotAFailure:
+    """uttyler.edu's robots.txt disallows its own article paths.
+
+    Not fetching them is the crawler working. Counting it as a fetch failure,
+    beside 404s and timeouts, makes correct behaviour look like breakage - the
+    same mistake as filing a declined site-wide source under "errors".
+    """
+
+    def test_the_counters_are_separate(self):
+        from scrapev3.crawl import CrawlStats
+
+        stats = CrawlStats()
+        assert stats.robots_disallowed == 0 and stats.failed == 0
+        stats.robots_disallowed += 1
+        assert stats.failed == 0, "obeying robots.txt is not a failure"
+        assert stats.by_failure == {}, "and it does not need a failure reason"

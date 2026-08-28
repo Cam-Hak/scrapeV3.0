@@ -108,6 +108,7 @@ class _FakeFetcher:
         r.ok = url in self.ok_urls
         r.text = "<rss></rss>" if r.ok else ""
         r.status = 200 if r.ok else 404
+        r.final_url = url
         r.wall = None
         r.from_cache = False
         r.error = None
@@ -391,6 +392,7 @@ class TestListingFastPath:
             r.ok = url.rstrip("/") == self._page.rstrip("/")
             r.text = self._html if r.ok else ""
             r.status = 200 if r.ok else 404
+            r.final_url = url
             r.wall = r.error = None
             r.from_cache = False
             r.headers = {}
@@ -631,3 +633,132 @@ class TestCorroborationNeedsSomethingToCorroborateAgainst:
         assert sources._covers_target(
             self._found("https://northernvermont.edu/category/news-center/real-3"),
             html, self.PAGE, self.SECTION, False)
+
+
+class TestRelativeLinksResolveAgainstTheResponse:
+    """Relative hrefs resolve against where the response came from, never
+    against the canonicalised URL we asked for.
+
+    Found on ccu.edu, which stored zero articles while reporting success.
+    The target is https://ccu.edu/news; the server redirects to
+    https://www.ccu.edu/news/ and its links are relative with no leading
+    slash ("2026/some-story/"). Resolving those against the canonical form -
+    which has had its trailing slash stripped - makes urljoin treat "news" as
+    a file rather than a directory, so every article URL lost its /news/
+    segment. Twelve fetches, twelve 404s, and the frontier recorded the domain
+    as successfully crawled because discovery itself had "worked".
+    """
+
+    HTML = """
+    <html><body><main>
+      <a href="2026/world-changers-scholarship-recipients/">World Changers</a>
+      <a href="2026/steve-taylor-to-retire-as-dean-of-school-of-music/">Dean retires</a>
+    </main></body></html>
+    """
+    ASKED_FOR = "https://ccu.edu/news"          # canonical: no www, no slash
+    CAME_FROM = "https://www.ccu.edu/news/"     # what the server actually served
+
+    def test_the_section_segment_survives(self):
+        refs = sources.harvest_links(self.HTML, self.ASKED_FOR,
+                                     base_url=self.CAME_FROM)
+        urls = [r.url for r in refs]
+        assert urls, "the links must be harvested at all"
+        assert all("/news/2026/" in u for u in urls), urls
+
+    def test_without_the_real_base_the_path_is_wrong(self):
+        """Pins the failure itself, so a refactor that drops `base_url`
+        cannot quietly reintroduce twelve 404s."""
+        refs = sources.harvest_links(self.HTML, self.ASKED_FOR)
+        assert all("/news/" not in r.url for r in refs)
+
+    async def test_from_listing_uses_the_final_url(self):
+        class _Fetcher:
+            async def get(self, url, **kw):
+                r = type("R", (), {})()
+                r.ok, r.status, r.text = True, 200, TestRelativeLinksResolveAgainstTheResponse.HTML
+                r.final_url = TestRelativeLinksResolveAgainstTheResponse.CAME_FROM
+                r.wall = r.error = None
+                r.from_cache, r.headers = False, {}
+                return r
+
+        found = await sources.from_listing(_Fetcher(), self.ASKED_FOR, limit=10)
+        assert found.articles
+        assert all("/news/2026/" in a.url for a in found.articles)
+
+
+class TestDeclinedSourcesAreNotErrors:
+    """A source declined for the right reason is a decision, not a failure.
+
+    One clean ten-domain run printed nine "errors", every one of them the
+    cascade correctly refusing a site-wide feed or an unscoped sitemap. An
+    error list that fills up on healthy runs is an error list nobody reads,
+    which is precisely how a real failure goes unnoticed - so the two travel
+    on separate channels.
+    """
+
+    def test_discovery_carries_both_channels(self):
+        found = sources.Discovery(method="rss")
+        assert found.errors == []
+        assert found.notes == []
+
+    def test_the_own_content_veto_is_a_note_not_an_error(self):
+        """ufw.org's press-clipping feed: real articles, wrong publisher.
+        Rejecting it is the guard working, and it belongs in notes."""
+        found = sources.Discovery(method="rss")
+        found.notes.append("ignoring rss: 28 of 30 results are not ufw.org")
+        assert found.errors == []
+        assert len(found.notes) == 1
+
+    def test_crawl_stats_keeps_them_apart(self):
+        from scrapev3.crawl import CrawlStats
+
+        stats = CrawlStats()
+        assert stats.errors == [] and stats.notes == []
+        stats.errors.append("example.org: feed fetch failed: 503")
+        stats.notes.append("example.org: ignoring site-wide feed")
+        assert len(stats.errors) == 1, "a real failure still lands in errors"
+        assert len(stats.notes) == 1
+
+
+class TestAnUnreachableNewsroomPageSaysSo:
+    """"All discovery methods failed" is true and useless when the target's own
+    page returned 403.
+
+    lawsociety.org.uk serves a branded "403 - The Law Society" page. That is a
+    refusal, not a solvable challenge, so it is correctly not a bot wall - and
+    the cascade then ran every source against a site refusing us and reported
+    the symptom while hiding the cause.
+    """
+
+    class _Refusing:
+        def __init__(self, status=403):
+            self.status = status
+            self.requested: list[str] = []
+
+        async def robots_for(self, url):
+            class Rules:
+                sitemaps: list[str] = []
+            return Rules()
+
+        async def get(self, url, **kw):
+            self.requested.append(url)
+            r = type("R", (), {})()
+            r.ok, r.status, r.text = False, self.status, ""
+            r.final_url, r.wall, r.error = url, None, None
+            r.from_cache, r.headers = False, {}
+            return r
+
+    async def test_the_status_is_reported(self):
+        f = self._Refusing()
+        found = await sources.discover(f, "https://lawsociety.org.uk/all-news", limit=10)
+        assert found.method == "none"
+        assert any("403" in e for e in found.errors), found.errors
+
+    async def test_the_page_is_not_requested_twice(self):
+        """A fast path that already tried the newsroom page and was refused
+        must not make the cascade pay the per-host delay for the same 403."""
+        f = self._Refusing()
+        await sources.discover(f, "https://lawsociety.org.uk/all-news",
+                               known_method="listing", limit=10)
+        newsroom_hits = [u for u in f.requested if u.endswith("/all-news")]
+        assert len(newsroom_hits) == 1, f.requested
