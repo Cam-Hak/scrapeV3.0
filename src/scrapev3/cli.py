@@ -342,6 +342,104 @@ def _cmd_frontier_seed(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_status(args: argparse.Namespace) -> int:
+    """Compose per-agency health, and optionally publish it for the website."""
+    from . import status as status_mod
+    from .frontier import open_frontier
+    from .sink import Sink
+
+    settings = Settings.load()
+    frontier = open_frontier()
+    sink = Sink(settings.data_dir)
+    try:
+        rows = status_mod.compose(frontier, sink)
+    finally:
+        sink.close()
+        frontier.close()
+
+    if args.severity:
+        rows = [r for r in rows if r.severity == args.severity]
+    if args.health:
+        rows = [r for r in rows if r.health == args.health]
+    if args.domain:
+        rows = [r for r in rows if r.domain == args.domain]
+
+    if args.json is not None:
+        payload = status_mod.to_json(rows)
+        if args.json == "-":
+            console.print_json(payload)
+        else:
+            Path(args.json).write_text(payload, encoding="utf-8")
+            console.print(f"Wrote {len(rows)} agencies to {args.json}")
+        return 0
+
+    if args.publish:
+        return _publish_status(settings, rows, prune=not (
+            args.severity or args.health or args.domain))
+
+    _print_status(rows, status_mod.summarise(rows), limit=args.limit)
+    return 0
+
+
+def _publish_status(settings: Settings, rows, *, prune: bool) -> int:
+    """Push the grid to MySQL for the website to read."""
+    from . import status as status_mod
+
+    try:
+        conn = status_mod.connect(settings)
+    except Exception as exc:                                # noqa: BLE001
+        console.print(f"[red]Cannot reach the status table:[/red] {exc}")
+        console.print("[dim]It lives in MySQL - set SCRAPEV3_MYSQL_HOST in .env[/dim]")
+        return 2
+    try:
+        status_mod.ensure_table(conn)
+        written = status_mod.publish(conn, rows)
+        # Only when publishing the whole grid. Pruning against a filtered set
+        # would delete every agency the filter excluded.
+        dropped = status_mod.prune(conn, [r.a_id for r in rows]) if prune else 0
+    finally:
+        conn.close()
+
+    console.print(f"Published {written} agencies to "
+                  f"{settings.mysql.state_db}.agency_status.")
+    if dropped:
+        console.print(f"[dim]Removed {dropped} row(s) for agencies no longer "
+                      f"in the frontier.[/dim]")
+    return 0
+
+
+_SEVERITY_STYLE = {"ok": "green", "warn": "yellow", "error": "red"}
+
+
+def _print_status(rows, summary: dict, *, limit: int) -> None:
+    from .status import RECENT_DAYS, severity_of
+
+    if not rows:
+        console.print("[dim]No agencies match.[/dim]")
+        return
+    parts = [f"[{_SEVERITY_STYLE.get(severity_of(h), 'white')}]{h} {n}[/]"
+             for h, n in sorted(summary.items(), key=lambda kv: -kv[1])]
+    console.print("  ".join(parts))
+
+    t = Table(header_style="bold")
+    t.add_column("a_id", justify="right")
+    t.add_column("Domain", overflow="fold")
+    t.add_column("Health")
+    t.add_column("Source")
+    t.add_column("Articles", justify="right")
+    t.add_column(f"Last {RECENT_DAYS}d", justify="right")
+    t.add_column("Why", overflow="fold")
+    for r in rows[:limit]:
+        style = _SEVERITY_STYLE.get(r.severity, "white")
+        t.add_row(str(r.a_id), r.domain, f"[{style}]{r.health}[/{style}]",
+                  r.discovery_method or "-", str(r.articles),
+                  str(r.articles_recent), r.reason or "")
+    console.print(t)
+    if len(rows) > limit:
+        console.print(f"[dim]{len(rows) - limit} more; raise --limit or filter "
+                      f"with --severity / --health.[/dim]")
+
+
 def _removed_agency_ids(settings: Settings) -> set[int]:
     """The removal list, or an empty set if it cannot be reached.
 
@@ -1435,6 +1533,24 @@ def main(argv: list[str] | None = None) -> int:
                           help="Take an agency off the list. Does NOT restore "
                                "anything already deleted; re-seed for that")
     p_remove.set_defaults(func=_cmd_remove)
+
+    p_status = sub.add_parser(
+        "status",
+        help="Per-agency health, for the website's grid. Read-only unless --publish.")
+    p_status.add_argument("--publish", action="store_true",
+                          help="Upsert the grid into MySQL for the website to read")
+    p_status.add_argument("--json", nargs="?", const="-", default=None,
+                          metavar="PATH",
+                          help="Emit the same payload as JSON; '-' prints it. "
+                               "Feeds clients/status_demo.php when there is no DB")
+    p_status.add_argument("--severity", choices=["ok", "warn", "error"],
+                          default=None, help="Only agencies in this band")
+    p_status.add_argument("--health", default=None,
+                          help="Only this health word (healthy, empty, stale, ...)")
+    p_status.add_argument("--domain", default=None, help="Only this domain")
+    p_status.add_argument("--limit", type=int, default=40,
+                          help="Rows to print (default 40)")
+    p_status.set_defaults(func=_cmd_status)
 
     p_audit = sub.add_parser(
         "audit", help="Run discovery across targets and rank what looks wrong.")

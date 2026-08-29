@@ -63,6 +63,8 @@ class CrawlStats:
     too_old: int = 0
     # Agencies purged this pass because the shared removal list named them.
     removed_agencies: int = 0
+    # Agency rows written to the website's status grid, when publishing is on.
+    status_published: int = 0
     tns_loaded: int = 0
     tns_rejected: int = 0
     tns_failed: int = 0
@@ -380,6 +382,39 @@ def _apply_removals(settings: Settings, frontier: Frontier, sink: Sink,
     return len(reports)
 
 
+def _publish_status(settings: Settings, frontier: Frontier, sink: Sink,
+                    stats: CrawlStats) -> int:
+    """Publish per-agency health for the website. Never raises.
+
+    Runs at the END of a pass, on the state the pass just produced, so the grid
+    a publisher refreshes reflects the crawl that has actually finished rather
+    than the one about to start.
+
+    The whole grid is rewritten, not only the domains this pass leased: health
+    is time-dependent - a site goes stale by the clock, without anything
+    happening to it - so a row nobody visited this pass still has to be
+    recomputed or it stays green forever.
+    """
+    from . import status as status_mod
+
+    try:
+        rows = status_mod.compose(frontier, sink)
+        conn = status_mod.connect(settings)
+    except Exception as exc:                                # noqa: BLE001
+        stats.errors.append(f"status not published: {type(exc).__name__}: {exc}")
+        return 0
+    try:
+        status_mod.ensure_table(conn)
+        written = status_mod.publish(conn, rows)
+        status_mod.prune(conn, [r.a_id for r in rows])
+        return written
+    except Exception as exc:                                # noqa: BLE001
+        stats.errors.append(f"status not published: {type(exc).__name__}: {exc}")
+        return 0
+    finally:
+        conn.close()
+
+
 async def crawl_once(
     *,
     settings: Settings | None = None,
@@ -475,6 +510,12 @@ async def crawl_once(
 
             await asyncio.gather(*(one_domain(r) for r in leased))
     finally:
+        # In `finally`, not after the gather, so it also runs on the two paths
+        # that skip the crawl body: nothing due to lease, and an exception. The
+        # grid ages by the clock rather than by what was crawled, so a pass that
+        # leased nothing still has staleness to report.
+        if settings.status_enabled:
+            stats.status_published = _publish_status(settings, frontier, sink, stats)
         if owns_sink:
             sink.close()
         if owns_frontier:

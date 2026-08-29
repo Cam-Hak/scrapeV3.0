@@ -227,6 +227,43 @@ class Sink:
             sql, params = "DELETE FROM article", ()
         return self.db.execute(sql, params).rowcount
 
+    def article_stats(self, *, since: datetime) -> dict[int, tuple[int, int, str | None, str | None]]:
+        """Per-agency article totals, recent volume, and two timestamps.
+
+        Returns a_id -> (total, since `since`, latest published_at, latest
+        first_seen_at).
+
+        The two dates answer different questions and both are needed. The
+        publisher's date says whether the newsroom is still publishing; ours
+        says when this agency's crawl last demonstrably worked, which is the
+        only evidence left when the frontier's own bookkeeping is missing.
+
+        A total on its own only ever goes up, so a feed that broke six months
+        ago still shows a healthy-looking number; the windowed count is what
+        makes a stalled site visible. Both come from one grouped scan.
+
+        `published_at` is the publisher's own date, not `first_seen_at`: the
+        question the grid answers is whether the newsroom is still publishing,
+        which our crawl timestamps cannot tell apart from our own schedule.
+        Rows with no a_id (an unmatched agency) are skipped rather than bucketed
+        under a fake id.
+
+        The timestamp comes back as the stored ISO string rather than a parsed
+        datetime. Dates arrive here from two backends in three formats, and one
+        parser that knows about all of them (`status._as_dt`) is safer than a
+        second one here that quietly disagrees with it.
+        """
+        rows = self.db.execute(
+            "SELECT a_id, COUNT(*), "
+            "       SUM(CASE WHEN COALESCE(published_at, first_seen_at) >= ? "
+            "                THEN 1 ELSE 0 END), "
+            "       MAX(published_at), MAX(first_seen_at) "
+            "FROM article WHERE a_id IS NOT NULL GROUP BY a_id",
+            (since.isoformat(sep="T", timespec="seconds"),),
+        ).fetchall()
+        return {int(a_id): (int(total), int(recent or 0), published, seen)
+                for a_id, total, recent, published, seen in rows}
+
     def remove_agency(self, a_id: int) -> int:
         """Delete one agency's rows from the dedup index.
 

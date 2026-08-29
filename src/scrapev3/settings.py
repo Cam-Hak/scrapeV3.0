@@ -193,6 +193,11 @@ class Settings:
     # MySQL, and a crawler that cannot reach it should not be silently deciding
     # that nobody has asked to be removed.
     removal: str = field(default_factory=lambda: _env("REMOVAL", "off").strip().lower())
+    # Whether a finished pass publishes per-agency health for the website's
+    # grid. Off by default for the same reason as `removal`: it needs MySQL, and
+    # a dashboard silently frozen at last week's numbers is worse than one that
+    # is visibly not there.
+    status: str = field(default_factory=lambda: _env("STATUS", "off").strip().lower())
 
     @property
     def tns_sink_enabled(self) -> bool:
@@ -201,6 +206,10 @@ class Settings:
     @property
     def removal_enabled(self) -> bool:
         return self.removal in {"on", "true", "1", "yes"}
+
+    @property
+    def status_enabled(self) -> bool:
+        return self.status in {"on", "true", "1", "yes"}
 
     @classmethod
     def load(cls, dotenv: str | Path = ".env") -> "Settings":

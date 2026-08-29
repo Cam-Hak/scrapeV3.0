@@ -33,14 +33,20 @@ scrapev3 doctor                          # deps, identity, MySQL, tns tables
 scrapev3 seed data/sites.csv             # load targets into the frontier
 scrapev3 frontier                        # what is due, and which schedule mode
 scrapev3 crawl --domains 10 --max-articles 5
+scrapev3 crawl --domain example.org --debug    # log every decision, one line each
 scrapev3 show --full --limit 3           # what the extractor actually got
 scrapev3 audit --limit 60                # discovery correctness, read-only
 scrapev3 audit --rescore data/audits/x.jsonl   # re-score saved evidence, no fetching
 scrapev3 tns status | tns backfill [--resync] | tns show --full
 scrapev3 reset --a-id 22385 --tns        # forget one agency across all stores
+scrapev3 remove --a-id 22385             # honour a removal request, permanently
+scrapev3 remove --list | remove --apply  # the shared list; reconcile it now
+scrapev3 status --health empty           # per-agency health; --publish for the website
+scrapev3 status --json clients/sample_status.json   # refresh the demo page's fixture
 
 python scripts/extract_sites.py          # scrape_test.csv -> data/sites.{csv,txt}
 python scripts/validate_targets.py run --limit 100   # end-to-end stored-article sweep
+python scripts/sql.py "SELECT * FROM domain_state LIMIT 5"   # read-only, safe mid-crawl
 ```
 
 Tests are offline except `tests/test_politeness.py`, which spins up a local HTTP
@@ -67,6 +73,9 @@ nothing on a daily re-crawl.
 | [tns/](src/scrapev3/tns/) | `record.py` composes the row (pure, no I/O), `agencies.py` reads lookups, `sink.py` inserts |
 | [urls.py](src/scrapev3/urls.py) | `registrable_domain`, `canonical_url`, `classify_url`, `is_non_news_path` |
 | [audit.py](src/scrapev3/audit.py) | Scores discovery output for plausibility without fetching articles |
+| [removal.py](src/scrapev3/removal.py) | Purges one `a_id` from every store; owns the shared removal list |
+| [status.py](src/scrapev3/status.py) | Per-agency health for the website's grid; `classify` is pure |
+| [tracing.py](src/scrapev3/tracing.py) | `--debug` decision logging, printed through the progress bar's Console |
 
 **The queue hands out domain leases, not URLs.** That is the load-bearing
 decision: one worker owns an eTLD+1 at a time, so politeness is mutual exclusion
@@ -107,6 +116,29 @@ feed/wp-json bodies are `FEED`/`CMS_API`, not `TRAFILATURA`.
   `data/articles.sqlite` (dedup — `seen_url` runs before the fetch, so skipping it
   makes a re-run silently store nothing), and the frontier calendar. `reset --tns`
   does all three. Don't reach for `crawl --refetch` while the MySQL rows still exist.
+- **`reset` and `remove` are different operations.** `reset` un-does a test run;
+  the agency stays in the frontier and comes back on the next crawl. `remove`
+  honours a publisher's request: it purges the `a_id` everywhere *and* records it
+  on a shared MySQL list (`removed_agency`) that `seed` consults, because `seed`
+  upserts every row of `data/sites.csv` and would otherwise resurrect it. The
+  list is reconciled — the whole set is re-applied each pass, never drained —
+  so two crawlers cannot each consume the other's removals. The website inserts
+  into that one table; see [clients/](clients/). Off unless `SCRAPEV3_REMOVAL=on`.
+- **The crawler decides health; the website only draws it.** `agency_status`
+  carries a `health` word, a `severity` (`ok`/`warn`/`error`) and a `reason`
+  sentence, so `clients/status.php` renders without re-deriving anything — two
+  definitions of "healthy" would drift and the grid would quietly disagree with
+  the crawler. `severity` is a closed vocabulary and unknown words resolve to
+  `warn`, so a new fault added here shows as a problem on a website nobody has
+  redeployed. Two distinctions carry the weight: `quiet` (we crawl it fine, the
+  publisher has not posted) is *not* a fault, and `empty` (we crawl it fine and
+  store nothing) is a different fault from `stale` (we stopped reaching it) —
+  `empty` was 92 of the first 324 agencies crawled. Off unless `SCRAPEV3_STATUS=on`.
+- **Discovery can change which domain a target belongs to.** A publisher that
+  redirects to a new home (`dni.gov` -> `odni.gov`) has its identity re-derived
+  mid-cascade, so downstream code must read `Discovery.target_domain` rather than
+  the domain it started with — otherwise every article it found is discarded as
+  off-domain. Relative hrefs resolve against `resp.final_url` for the same reason.
 - **Structural signals over class names.** The listing-page fallback filters by
   `<nav>/<header>/<footer>/<aside>` landmarks, because guessing class names is
   exactly the rot this project exists to eliminate.
@@ -134,6 +166,8 @@ feed/wp-json bodies are `FEED`/`CMS_API`, not `TRAFILATURA`.
 - Comments here explain *why*, usually naming the real site and the measured
   number behind a rule (`battelle.org`, `fightcancer.org`, `ufw.org`). Match that
   when adding a guard: a rule without its evidence gets tuned away later.
+- Decision logging uses lazy `%s` interpolation, never f-strings: it sits in the
+  per-article loop and must cost nothing when `--debug` is off.
 - Every silent-quality bug fixed gets a regression test. That is what the suite is
   for — the failures that matter are plausible-looking wrong data, not exceptions.
 - `dbs/` holds restores of the live `tns` schema and is gitignored.

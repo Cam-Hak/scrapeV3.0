@@ -503,6 +503,25 @@ class Frontier(ABC):
                 [to_ts(utcnow()), EPOCH, *params])
         return len(affected)
 
+    def status_rows(self) -> list[tuple]:
+        """Per-target state, with the domain-level signals attached.
+
+        One query rather than a call per agency: this runs over every target
+        the crawler holds (2,401 of them) to build the website's grid, and a
+        round trip each would make publishing status cost more than the crawl.
+
+        `needs_browser` is on `domain_state`, not `target`, because a site that
+        renders its articles with JavaScript does so for the whole site - so it
+        is joined in rather than duplicated. LEFT, so a target seeded but never
+        leased still gets a row instead of vanishing from the grid.
+        """
+        return self._execute(
+            "SELECT t.a_id, t.domain, t.newsroom_url, t.enabled, "
+            "       t.discovery_method, t.last_success_at, t.consec_failures, "
+            "       t.p50_body_len, d.needs_browser "
+            "FROM target t LEFT JOIN domain_state d ON d.domain = t.domain "
+            "ORDER BY t.a_id, t.newsroom_url")
+
     def remove_agency(self, a_id: int) -> tuple[int, int]:
         """Delete one agency's targets, and any domain left with none.
 
