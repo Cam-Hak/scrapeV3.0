@@ -252,11 +252,16 @@ class Sink:
         so an interrupted run leaves the original intact rather than a
         half-written archive. `os.replace` is atomic within a filesystem.
         """
+        # Close the day's append handle FIRST. Windows refuses to replace a
+        # file that still has an open handle, so doing this afterwards makes
+        # every purge fail with PermissionError - caught upstream and recorded,
+        # leaving the archive silently intact. `write` reopens lazily.
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
         removed = files = 0
         for path in sorted((self.data_dir / "articles").glob("articles-*.jsonl")):
-            if self._fh is not None and path == self._path:
-                self._fh.flush()
-
             kept: list[str] = []
             dropped = 0
             with path.open(encoding="utf-8") as fh:
@@ -282,10 +287,6 @@ class Sink:
             removed += dropped
             files += 1
 
-        # The handle now points at a file that has been replaced underneath it.
-        if self._fh is not None:
-            self._fh.close()
-            self._fh = None
         return removed, files
 
     def pending_tns(self, limit: int | None = None) -> list[tuple[str, str, int | None]]:

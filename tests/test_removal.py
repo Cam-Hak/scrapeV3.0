@@ -175,3 +175,72 @@ class TestSeedDoesNotResurrect:
         frontier.remove_agency(100)
         frontier.upsert_sites([(100, "https://a.house.gov/press", "house.gov")])
         assert 100 in {t.a_id for t in frontier.targets_for("house.gov")}
+
+
+class TestGoneFromEveryStore:
+    """The claim the feature actually makes: after a removal, that agency is in
+    none of the places this program keeps things.
+
+    Written as one test over every store rather than four separate ones,
+    because the failure worth catching is a store being *forgotten* - and a
+    per-store test suite cannot fail for a store nobody remembered to add. The
+    earlier tests here covered the frontier and the archive, and would all have
+    passed while the dedup index quietly kept every row.
+    """
+
+    A_ID = 100
+    OTHER = 200
+
+    def _populate(self, sink: Sink) -> None:
+        """Store two articles through the real write path, one per agency."""
+        from datetime import datetime
+
+        from scrapev3.extract.models import Article, DateResult
+
+        for a_id, url in ((self.A_ID, "https://a.house.gov/press/one"),
+                          (self.OTHER, "https://b.house.gov/press/two")):
+            article = Article(url=url)
+            article.headline = f"Headline for {a_id}"
+            article.body = "word " * 200
+            article.date = DateResult(value=datetime(2026, 8, 20))
+            assert sink.write(article, domain="house.gov", a_id=a_id)
+
+    def test_the_agency_is_gone_and_the_others_are_not(self, frontier, sink):
+        self._populate(sink)
+
+        class _Tns:
+            """Stands in for press_release, recording what it was asked to drop."""
+            def __init__(self):
+                self.deleted: list[int] = []
+
+            def delete_rows(self, a_ids):
+                self.deleted.extend(a_ids)
+                return len(a_ids)
+
+        tns = _Tns()
+        report = removal.remove(self.A_ID, frontier=frontier, sink=sink, tns=tns)
+
+        # 1. the frontier
+        assert self.A_ID not in {t.a_id for t in frontier.targets_for("house.gov")}
+        # 2. the dedup index - the store the other tests here never checked
+        assert sink.db.execute(
+            "SELECT count(*) FROM article WHERE a_id = ?", (self.A_ID,)
+        ).fetchone()[0] == 0
+        # 3. the JSONL archive
+        archive = (sink.data_dir / "articles").glob("articles-*.jsonl")
+        ids = [json.loads(line)["a_id"]
+               for path in archive
+               for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert self.A_ID not in ids
+        # 4. press_release
+        assert tns.deleted == [self.A_ID]
+
+        # and the report says so, per store
+        assert report.targets == 1 and report.indexed == 1 and report.archived == 1
+
+        # The agency that did not ask to leave is untouched in every one of them.
+        assert self.OTHER in {t.a_id for t in frontier.targets_for("house.gov")}
+        assert sink.db.execute(
+            "SELECT count(*) FROM article WHERE a_id = ?", (self.OTHER,)
+        ).fetchone()[0] == 1
+        assert self.OTHER in ids
