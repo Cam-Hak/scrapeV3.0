@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 from datetime import datetime
@@ -214,7 +215,9 @@ class Sink:
         a re-run after truncating MySQL otherwise stores nothing at all.
 
         The JSONL archive is left alone. It is append-only on purpose; a
-        re-crawl adds a fresh line rather than rewriting history.
+        re-crawl adds a fresh line rather than rewriting history. The single
+        exception is `purge_archive`, used when an agency is removed on
+        request - there the history going is the point.
         """
         if domain:
             sql, params = "DELETE FROM article WHERE domain = ?", (domain,)
@@ -223,6 +226,67 @@ class Sink:
         else:
             sql, params = "DELETE FROM article", ()
         return self.db.execute(sql, params).rowcount
+
+    def remove_agency(self, a_id: int) -> int:
+        """Delete one agency's rows from the dedup index.
+
+        Distinct from `forget`, which drops rows so the articles are fetched
+        *again*. This drops them because the agency is gone, and is paired with
+        `purge_archive` so the index and the archive do not disagree about what
+        exists.
+        """
+        return self.db.execute(
+            "DELETE FROM article WHERE a_id = ?", (a_id,)).rowcount
+
+    def purge_archive(self, a_id: int) -> tuple[int, int]:
+        """Rewrite every daily JSONL without this agency's records.
+
+        Returns (records removed, files rewritten).
+
+        The one irreversible step in a removal, and the one exception to the
+        archive being append-only: `forget` leaves it alone precisely so a
+        re-crawl appends rather than rewriting history, but a removal request
+        is a request for the history to go.
+
+        Written to a temporary file in the same directory and moved into place,
+        so an interrupted run leaves the original intact rather than a
+        half-written archive. `os.replace` is atomic within a filesystem.
+        """
+        removed = files = 0
+        for path in sorted((self.data_dir / "articles").glob("articles-*.jsonl")):
+            if self._fh is not None and path == self._path:
+                self._fh.flush()
+
+            kept: list[str] = []
+            dropped = 0
+            with path.open(encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    try:
+                        if json.loads(line).get("a_id") == a_id:
+                            dropped += 1
+                            continue
+                    except json.JSONDecodeError:
+                        pass        # keep anything unparseable rather than lose it
+                    kept.append(line)
+            if not dropped:
+                continue
+
+            tmp = path.with_suffix(".jsonl.tmp")
+            with tmp.open("w", encoding="utf-8") as out:
+                out.writelines(kept)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp, path)
+            removed += dropped
+            files += 1
+
+        # The handle now points at a file that has been replaced underneath it.
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+        return removed, files
 
     def pending_tns(self, limit: int | None = None) -> list[tuple[str, str, int | None]]:
         """Articles never loaded, or whose load failed. Returns (url, domain, a_id)."""

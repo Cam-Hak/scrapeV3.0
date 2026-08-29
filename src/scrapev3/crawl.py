@@ -61,6 +61,8 @@ class CrawlStats:
     # discovered, 36 stored and zero in every rejection row looks broken, and
     # the honest answer was "the rest were older than --max-age-days".
     too_old: int = 0
+    # Agencies purged this pass because the shared removal list named them.
+    removed_agencies: int = 0
     tns_loaded: int = 0
     tns_rejected: int = 0
     tns_failed: int = 0
@@ -352,6 +354,32 @@ async def _extract_ref(fetcher: PoliteFetcher, ref: ArticleRef,
     return article
 
 
+def _apply_removals(settings: Settings, frontier: Frontier, sink: Sink,
+                    tns: "TnsSink | None", stats: CrawlStats) -> int:
+    """Purge every agency on the shared removal list. Never raises."""
+    from . import removal
+
+    try:
+        conn = removal.connect(settings)
+    except Exception as exc:                                # noqa: BLE001
+        stats.errors.append(f"removal list unreachable: {type(exc).__name__}: {exc}")
+        return 0
+    try:
+        removal.ensure_table(conn)
+        reports = removal.reconcile(removal.listed(conn), frontier=frontier,
+                                    sink=sink, tns=tns)
+    except Exception as exc:                                # noqa: BLE001
+        stats.errors.append(f"removal list failed: {type(exc).__name__}: {exc}")
+        return 0
+    finally:
+        conn.close()
+
+    for report in reports:
+        stats.errors.extend(f"removing a_id {report.a_id}: {e}"
+                            for e in report.errors)
+    return len(reports)
+
+
 async def crawl_once(
     *,
     settings: Settings | None = None,
@@ -377,6 +405,14 @@ async def crawl_once(
 
     try:
         frontier.release_expired_leases()
+
+        # Before anything is leased, so a removal takes effect this pass rather
+        # than the next one. An unreachable list is logged and stepped over: a
+        # dashboard being down is an intake problem, not a reason to stop
+        # collecting news, and the list is reconciled again next pass anyway.
+        if settings.removal_enabled:
+            stats.removed_agencies = _apply_removals(settings, frontier, sink,
+                                                     tns, stats)
         # A named scope bypasses the due-queue; the schedule is what is being
         # overridden, never the lease or the per-host pacing.
         leased = (frontier.acquire_domains(worker_id, only_domains) if only_domains

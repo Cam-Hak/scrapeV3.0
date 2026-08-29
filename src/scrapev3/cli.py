@@ -314,6 +314,20 @@ def _cmd_frontier_seed(args: argparse.Namespace) -> int:
                 if url and dom:
                     rows.append((0, url, dom))
 
+    # Seeding upserts every row of the source CSV, so without this a removed
+    # agency comes straight back on the next seed - which would make the whole
+    # removal path decorative. The tombstone list is the durable record; the
+    # CSV is derived from v2's export and is regenerated, so editing it would
+    # not survive either.
+    settings = Settings.load()
+    skipped = 0
+    if settings.removal_enabled:
+        removed = _removed_agency_ids(settings)
+        if removed:
+            before = len(rows)
+            rows = [r for r in rows if r[0] not in removed]
+            skipped = before - len(rows)
+
     store = open_frontier()
     try:
         n = store.upsert_sites(rows)
@@ -322,7 +336,124 @@ def _cmd_frontier_seed(args: argparse.Namespace) -> int:
         store.close()
 
     console.print(f"Seeded [bold]{n}[/bold] targets ({len({d for _, _, d in rows})} distinct domains)")
+    if skipped:
+        console.print(f"[dim]Skipped {skipped} target(s) whose agency has been removed[/dim]")
     _print_frontier_stats(stats)
+    return 0
+
+
+def _removed_agency_ids(settings: Settings) -> set[int]:
+    """The removal list, or an empty set if it cannot be reached.
+
+    Seeding must not fail because the list is unavailable; it just cannot
+    filter, and the next crawl reconciles anyway.
+    """
+    from . import removal
+
+    try:
+        conn = removal.connect(settings)
+    except Exception as exc:                                # noqa: BLE001
+        console.print(f"[yellow]Removal list unreachable, not filtering:[/yellow] {exc}")
+        return set()
+    try:
+        removal.ensure_table(conn)
+        return removal.listed(conn)
+    finally:
+        conn.close()
+
+
+def _cmd_remove(args: argparse.Namespace) -> int:
+    """Add an agency to the shared removal list, and purge it everywhere."""
+    from . import removal
+    from .frontier import open_frontier
+    from .sink import Sink
+
+    settings = Settings.load()
+    try:
+        conn = removal.connect(settings)
+    except Exception as exc:                                # noqa: BLE001
+        console.print(f"[red]Cannot reach the removal list:[/red] {exc}")
+        console.print("[dim]It lives in MySQL - set SCRAPEV3_MYSQL_HOST in .env[/dim]")
+        return 2
+
+    try:
+        removal.ensure_table(conn)
+
+        if args.list:
+            entries = removal.rows(conn)
+            if not entries:
+                console.print("[dim]No agencies have been removed.[/dim]")
+                return 0
+            t = Table(title="Removed agencies", header_style="bold")
+            t.add_column("a_id", justify="right")
+            t.add_column("Removed at")
+            t.add_column("Note", overflow="fold")
+            for a_id, when, note in entries:
+                t.add_row(str(a_id), str(when), note or "")
+            console.print(t)
+            return 0
+
+        if args.restore is not None:
+            dropped = removal.drop(conn, args.restore)
+            console.print(
+                f"Took a_id {args.restore} off the removal list ({dropped} row)."
+                if dropped else
+                f"[yellow]a_id {args.restore} was not on the list.[/yellow]")
+            console.print("[dim]Nothing already deleted is restored. Re-seed to "
+                          "put the targets back.[/dim]")
+            return 0
+
+        if args.a_id is not None:
+            removal.add(conn, args.a_id, args.note)
+        targets = removal.listed(conn) if args.apply else (
+            {args.a_id} if args.a_id is not None else set())
+        if not targets:
+            console.print("[red]Nothing to do.[/red] "
+                          "[dim]Give --a-id, or --apply to reconcile the whole list[/dim]")
+            return 2
+    finally:
+        conn.close()
+
+    frontier = open_frontier()
+    sink = Sink(settings.data_dir)
+    tns = None
+    if settings.tns_sink_enabled:
+        from .tns import open_tns_sink
+        try:
+            tns = open_tns_sink(settings)
+        except Exception as exc:                            # noqa: BLE001
+            console.print(f"[yellow]press_release not reachable, skipping it:[/yellow] {exc}")
+
+    try:
+        reports = removal.reconcile(targets, frontier=frontier, sink=sink, tns=tns)
+    finally:
+        sink.close()
+        frontier.close()
+        if tns is not None:
+            tns.close()
+
+    _print_removals(reports, targets)
+    return 0
+
+
+def _print_removals(reports, requested: set[int]) -> int:
+    if not reports:
+        console.print(f"[dim]Nothing left to remove for "
+                      f"{', '.join(str(a) for a in sorted(requested))}.[/dim]")
+        return 0
+    t = Table(title="Removed", header_style="bold")
+    t.add_column("a_id", justify="right")
+    for col in ("Targets", "Domains", "Indexed", "Archived", "press_release"):
+        t.add_column(col, justify="right")
+    for r in reports:
+        t.add_row(str(r.a_id), str(r.targets), str(r.domains), str(r.indexed),
+                  str(r.archived), str(r.press_releases))
+    console.print(t)
+    for r in reports:
+        for err in r.errors:
+            console.print(f"[red]a_id {r.a_id}:[/red] {err}")
+    console.print("[dim]The JSONL archive was rewritten; that part cannot be "
+                  "undone.[/dim]")
     return 0
 
 
@@ -1288,6 +1419,22 @@ def main(argv: list[str] | None = None) -> int:
     p_reset.add_argument("--yes", action="store_true",
                          help="Required to reset every domain at once")
     p_reset.set_defaults(func=_cmd_reset)
+
+    p_remove = sub.add_parser(
+        "remove",
+        help="Remove an agency on request: purge it everywhere and keep it out.")
+    p_remove.add_argument("--a-id", type=int, default=None,
+                          help="The agency to remove")
+    p_remove.add_argument("--note", default=None,
+                          help="Why, recorded on the shared list")
+    p_remove.add_argument("--list", action="store_true",
+                          help="Show the agencies already removed")
+    p_remove.add_argument("--apply", action="store_true",
+                          help="Reconcile the whole list now, without crawling")
+    p_remove.add_argument("--restore", type=int, default=None, metavar="A_ID",
+                          help="Take an agency off the list. Does NOT restore "
+                               "anything already deleted; re-seed for that")
+    p_remove.set_defaults(func=_cmd_remove)
 
     p_audit = sub.add_parser(
         "audit", help="Run discovery across targets and rank what looks wrong.")

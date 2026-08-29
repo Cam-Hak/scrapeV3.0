@@ -503,6 +503,43 @@ class Frontier(ABC):
                 [to_ts(utcnow()), EPOCH, *params])
         return len(affected)
 
+    def remove_agency(self, a_id: int) -> tuple[int, int]:
+        """Delete one agency's targets, and any domain left with none.
+
+        Returns (targets removed, domains removed).
+
+        The orphan check is the whole subtlety. `domain_state` is keyed on the
+        registrable domain and carries the pacing, lease and learned-discovery
+        state for every agency sharing it - house.gov carries 417. Deleting the
+        domain row because one of its agencies left would throw away the other
+        416 and their cached discovery sources. So a domain goes only when the
+        last target on it does.
+
+        Deliberately a delete, not `disable`: a removal request is not a pause,
+        and a row left behind with `enabled = 0` is a row somebody can turn back
+        on. The permanent record lives in the tombstone list, which `seed`
+        consults - see `removal.py`.
+        """
+        p = self.placeholder
+        targets = [r[0] for r in self._execute(
+            f"SELECT newsroom_url FROM target WHERE a_id = {p}", (a_id,))]
+        if not targets:
+            return 0, 0
+        domains = [r[0] for r in self._execute(
+            f"SELECT DISTINCT domain FROM target WHERE a_id = {p}", (a_id,))]
+
+        with self._transaction():
+            self._execute(f"DELETE FROM target WHERE a_id = {p}", (a_id,))
+            orphans = [r[0] for r in self._execute(
+                f"SELECT domain FROM domain_state WHERE domain IN "
+                f"({self._ph(len(domains))}) "
+                f"AND domain NOT IN (SELECT domain FROM target)", tuple(domains))]
+            if orphans:
+                self._execute(
+                    f"DELETE FROM domain_state WHERE domain IN "
+                    f"({self._ph(len(orphans))})", tuple(orphans))
+        return len(targets), len(orphans)
+
     def disable(self, domain: str) -> None:
         self._execute(
             "UPDATE domain_state SET enabled = 0 WHERE domain = {p}".format(

@@ -189,10 +189,18 @@ class Settings:
     data_dir: Path = field(default_factory=lambda: Path(_env("DATA_DIR", "./data")))
     # "jsonl" writes files only; "tns" additionally inserts into press_release.
     sink: str = field(default_factory=lambda: _env("SINK", "jsonl").strip().lower())
+    # Whether a crawl consults the shared removal list. Off by default: it needs
+    # MySQL, and a crawler that cannot reach it should not be silently deciding
+    # that nobody has asked to be removed.
+    removal: str = field(default_factory=lambda: _env("REMOVAL", "off").strip().lower())
 
     @property
     def tns_sink_enabled(self) -> bool:
         return self.sink in {"tns", "mysql", "press_release"}
+
+    @property
+    def removal_enabled(self) -> bool:
+        return self.removal in {"on", "true", "1", "yes"}
 
     @classmethod
     def load(cls, dotenv: str | Path = ".env") -> "Settings":
