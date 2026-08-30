@@ -63,6 +63,12 @@ class CrawlStats:
     too_old: int = 0
     # Agencies purged this pass because the shared removal list named them.
     removed_agencies: int = 0
+    # Targets seeded this pass because the shared request list named them.
+    requested_sites: int = 0
+    # Requests refused because the agency is also on the removal list. Counted
+    # rather than logged and forgotten: it means the website is asking for two
+    # incompatible things, and nobody finds that out from a quiet skip.
+    refused_requests: int = 0
     # Agency rows written to the website's status grid, when publishing is on.
     status_published: int = 0
     tns_loaded: int = 0
@@ -382,6 +388,38 @@ def _apply_removals(settings: Settings, frontier: Frontier, sink: Sink,
     return len(reports)
 
 
+def _apply_requests(settings: Settings, frontier: Frontier,
+                    stats: CrawlStats) -> tuple[int, int]:
+    """Seed every site on the shared request list. Never raises.
+
+    Returns (targets seeded, requests refused). The removal list is read here
+    too and wins: an agency on both must not be seeded, or a request would
+    quietly undo a removal a publisher asked for on every single pass.
+    """
+    from . import removal, site_requests
+
+    try:
+        conn = site_requests.connect(settings)
+    except Exception as exc:                                # noqa: BLE001
+        stats.errors.append(f"request list unreachable: {type(exc).__name__}: {exc}")
+        return 0, 0
+    try:
+        site_requests.ensure_table(conn)
+        removal.ensure_table(conn)
+        report = site_requests.reconcile(site_requests.listed(conn),
+                                         frontier=frontier,
+                                         removed=removal.listed(conn))
+    except Exception as exc:                                # noqa: BLE001
+        stats.errors.append(f"request list failed: {type(exc).__name__}: {exc}")
+        return 0, 0
+    finally:
+        conn.close()
+
+    stats.errors.extend(f"requested site has no usable domain: {u}"
+                        for u in report.invalid)
+    return report.seeded, len(report.refused)
+
+
 def _publish_status(settings: Settings, frontier: Frontier, sink: Sink,
                     stats: CrawlStats) -> int:
     """Publish per-agency health for the website. Never raises.
@@ -445,6 +483,13 @@ async def crawl_once(
         # than the next one. An unreachable list is logged and stepped over: a
         # dashboard being down is an intake problem, not a reason to stop
         # collecting news, and the list is reconciled again next pass anyway.
+        # Requests first, removals second, so a same-pass conflict resolves to
+        # removed. `reconcile` already refuses a request whose agency is on the
+        # removal list; running the purge afterwards as well means the order
+        # holds even if the two lists changed between the two reads.
+        if settings.requests_enabled:
+            stats.requested_sites, stats.refused_requests = _apply_requests(
+                settings, frontier, stats)
         if settings.removal_enabled:
             stats.removed_agencies = _apply_removals(settings, frontier, sink,
                                                      tns, stats)

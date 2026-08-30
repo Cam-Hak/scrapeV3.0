@@ -198,6 +198,11 @@ class Settings:
     # a dashboard silently frozen at last week's numbers is worse than one that
     # is visibly not there.
     status: str = field(default_factory=lambda: _env("STATUS", "off").strip().lower())
+    # Whether a crawl seeds the shared requested-site list. Its own switch, not
+    # `removal`'s: one says the website may take sites away and the other says
+    # it may add them, and an operator turning on the first has not agreed to
+    # the second.
+    requests: str = field(default_factory=lambda: _env("REQUESTS", "off").strip().lower())
 
     @property
     def tns_sink_enabled(self) -> bool:
@@ -210,6 +215,10 @@ class Settings:
     @property
     def status_enabled(self) -> bool:
         return self.status in {"on", "true", "1", "yes"}
+
+    @property
+    def requests_enabled(self) -> bool:
+        return self.requests in {"on", "true", "1", "yes"}
 
     @classmethod
     def load(cls, dotenv: str | Path = ".env") -> "Settings":

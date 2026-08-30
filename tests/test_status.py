@@ -13,6 +13,7 @@ added later cannot make the grid fall over.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -84,7 +85,7 @@ class TestTheRulesPeopleActuallySee:
         # calling it `failing` implies something regressed.
         health, reason = _classify(last_success_at=None, consec_failures=2)
         assert health == "never"
-        assert "2 attempt(s) failed" in reason
+        assert "2 attempts failed" in reason
 
     def test_failing_outranks_stale(self):
         # Staleness is the SYMPTOM of a failing crawl. Reporting the symptom
@@ -127,6 +128,19 @@ class TestTheRulesPeopleActuallySee:
             last_success_at=NOW - timedelta(days=status.STALE_AFTER_DAYS + 1))
         assert health == "stale"
         assert "days ago" in reason
+
+    def test_reasons_are_written_for_a_person_to_read(self):
+        # "1 days ago" and "1 crawls in a row" are what an f-string produces and
+        # what shipped until the grid was actually looked at in a browser. The
+        # reason is the sentence a person reads off the dashboard.
+        assert "1 day ago" in _classify(
+            last_success_at=NOW - timedelta(days=1))[1]
+        assert _classify(last_success_at=NOW)[1] == "crawled successfully today"
+        assert "1 crawl in a row" in _classify(
+            consec_failures=status.FAILING_AFTER, last_success_at=NOW)[1]             or status.FAILING_AFTER != 1
+        assert "3 crawls in a row failed" == _classify(consec_failures=3)[1]
+        assert "1 attempt failed" in _classify(
+            last_success_at=None, consec_failures=1)[1]
 
     def test_every_health_word_has_a_severity(self):
         # The website switches on severity. A health word with no band would
@@ -230,6 +244,108 @@ class TestOneAgencyWithSeveralNewsrooms:
         assert rows[0].discovery_method == "rss"
         assert rows[0].newsroom_url == "https://x.org/press"
 
+    def test_a_partly_solved_agency_does_not_report_as_solved(self, multi, sink):
+        # One of two newsrooms solved is not solved. A boolean here would read
+        # as done and hide the other one; the count is what makes the gap
+        # visible, and `targets_cached < targets` is the condition to branch on.
+        multi.release_target("https://x.org/press", success=True,
+                             discovery_method="rss")
+
+        row = status.compose(multi, sink)[0]
+        assert row.targets == 2
+        assert row.targets_cached == 1
+        assert row.discovery_method == "rss", "the solved one is still worth showing"
+
+    def test_the_cached_source_travels_with_the_newsroom_that_won(self, multi, sink):
+        # A feed URL from the dead newsroom attached to the live one's method is
+        # worse than none: it names a source that will never answer again.
+        multi._execute(
+            "UPDATE target SET feed_url = 'https://x.org/dead.xml', "
+            "discovery_method = 'rss' WHERE newsroom_url = 'https://x.org/news'")
+        multi.release_target("https://x.org/press", success=True,
+                             discovery_method="listing")
+
+        row = status.compose(multi, sink)[0]
+        assert row.discovery_method == "listing"
+        assert row.feed_url is None
+        assert row.targets_cached == 2
+
+
+class TestTheScheduleTheAgencySees:
+    """One agency, two domains, two different paces."""
+
+    @pytest.fixture()
+    def spread(self, tmp_path):
+        store = SQLiteFrontier(tmp_path / "spread.sqlite")
+        store.create_schema()
+        store.upsert_sites([
+            (600, "https://slow.org/news", "slow.org"),
+            (600, "https://fast.org/news", "fast.org"),
+        ])
+        store._execute(
+            "UPDATE domain_state SET next_allowed_at = '2030-01-01 00:00:00', "
+            "crawl_delay_s = 30.0 WHERE domain = 'slow.org'")
+        store._execute(
+            "UPDATE domain_state SET next_allowed_at = '2027-01-01 00:00:00', "
+            "crawl_delay_s = 5.0 WHERE domain = 'fast.org'")
+        yield store
+        store.close()
+
+    def test_next_due_is_the_soonest_of_them(self, spread, sink):
+        # When the agency next gets attention, which is when the first of its
+        # domains comes up - not the last.
+        row = status.compose(spread, sink)[0]
+        assert row.next_due_at.year == 2027
+
+    def test_the_crawl_delay_shown_is_the_politest_promise(self, spread, sink):
+        # Reporting 5s because one domain allows it would understate what the
+        # crawler actually promises the publisher on the other.
+        row = status.compose(spread, sink)[0]
+        assert row.crawl_delay_s == 30.0
+
+
+class TestWhenWePulledItAndWhenTheyPublishedIt:
+    """Two dates that look interchangeable and are not."""
+
+    def test_they_come_from_different_columns_and_can_disagree(self, frontier, sink):
+        # A newsroom republishing a 2019 item: the publisher's date is old, ours
+        # is today. Reading `last_article_at` as "when we last pulled something"
+        # would call this agency stale while it is working perfectly.
+        sink.db.execute(
+            "INSERT INTO article (url_hash, content_hash, domain, a_id, url, "
+            "headline, published_at, body_len, first_seen_at) "
+            "VALUES ('u1', 'c1', 'good.org', 100, 'https://good.org/a', 'h', "
+            "'2019-04-01 09:00:00', 900, '2026-08-28 04:00:00')")
+
+        row = next(r for r in status.compose(frontier, sink) if r.a_id == 100)
+        assert row.last_article_at.year == 2019, "the publisher's own date"
+        assert row.last_stored_at.year == 2026, "when we put it in the index"
+
+    def test_stored_but_never_loaded_is_visible(self, frontier, sink):
+        # The third silent failure, after `empty` and `stale`: we reached the
+        # site, extraction worked, and nothing reached press_release. Every
+        # count above it says this agency is fine.
+        _store(sink, 100, "good.org", "https://good.org/a", "2026-08-20 09:00:00")
+        _store(sink, 100, "good.org", "https://good.org/b", "2026-08-21 09:00:00")
+        sink.db.execute("UPDATE article SET tns_state = 'loaded' "
+                        "WHERE url = 'https://good.org/a'")
+
+        row = next(r for r in status.compose(frontier, sink) if r.a_id == 100)
+        assert row.articles == 2
+        assert row.tns_loaded == 1
+        assert row.tns_pending == 1
+        assert row.first_stored_at is not None
+
+    def test_a_rejected_article_counts_as_pending_not_loaded(self, frontier, sink):
+        # It will never load, and we know why - but it still did not land, and
+        # folding it into `tns_loaded` would report success for it.
+        _store(sink, 100, "good.org", "https://good.org/a", "2026-08-20 09:00:00")
+        sink.db.execute("UPDATE article SET tns_state = 'rejected'")
+
+        row = next(r for r in status.compose(frontier, sink) if r.a_id == 100)
+        assert row.tns_loaded == 0
+        assert row.tns_pending == 1
+
 
 class TestThePayloadTheWebsiteReads:
     def test_json_matches_the_columns_published_to_mysql(self, frontier, sink):
@@ -264,6 +380,103 @@ class TestThePayloadTheWebsiteReads:
         assert values["domain"] == row.domain
         assert values["health"] == row.health
         assert values["enabled"] in (0, 1), "MySQL wants a TINYINT, not a bool"
+
+    def test_every_boolean_is_a_tinyint_in_the_row(self, frontier, sink):
+        # Four of them now, and PyMySQL will happily write a Python bool as
+        # b'1' into a column that then compares unequal to 1.
+        values = dict(zip(status.COLUMNS, status.compose(frontier, sink)[0].as_row()))
+        for key in ("enabled", "needs_browser", "feed_absent", "conditional_get"):
+            assert values[key] in (0, 1), key
+
+    def test_the_inventory_columns_reach_the_payload(self, frontier, sink):
+        # The website reads JSON in development and MySQL in production, so a
+        # column that only exists in one of them is a page that works locally.
+        payload = json.loads(status.to_json(status.compose(frontier, sink)))
+        row = payload["agencies"][0]
+        for key in ("targets_cached", "feed_url", "next_due_at", "last_stored_at",
+                    "tns_pending", "crawl_delay_s"):
+            assert key in row
+
+    def test_the_migration_list_covers_every_column_added_after_the_first_ddl(self):
+        # `_DDL` is CREATE TABLE IF NOT EXISTS, so a column present there and
+        # absent from `_MIGRATIONS` appears on new deployments and never on the
+        # one already running - and nothing raises.
+        migrated = {c for c, _ in status._MIGRATIONS}
+        original = {
+            "a_id", "domain", "newsroom_url", "enabled", "health", "severity",
+            "reason", "discovery_method", "targets", "consec_failures",
+            "needs_browser", "articles", "articles_recent", "median_body_len",
+            "last_success_at", "last_article_at", "updated_at",
+        }
+        assert set(status.COLUMNS) - original == migrated
+
+
+class TestOnePageForEveryProducer:
+    """The view is a file both the crawler and the website fill in.
+
+    Two renderers - one Python, one PHP - kept in step by hand is the same
+    failure as two definitions of "healthy", and it happened: the first pair
+    disagreed about which columns existed within a day of being written. So the
+    page is `status_view.html`, and every producer does the same substitution.
+    """
+
+    def test_the_template_takes_only_a_payload_and_a_note(self):
+        # If a third placeholder appears, every producer has to learn to fill
+        # it - which is how the duplication starts again.
+        template = status.view_template()
+        assert set(re.findall(r"__[A-Z]+__", template)) == {"__DATA__", "__NOTE__"}
+
+    def test_rendering_leaves_nothing_unsubstituted(self, frontier, sink):
+        page = status.to_html(status.compose(frontier, sink))
+        assert not re.findall(r"__[A-Z]+__", page)
+
+    def test_the_page_carries_the_whole_payload_not_just_the_rows(self, frontier, sink):
+        # The header is built from `summary` and `generated_at` by the page, so
+        # a producer cannot render a header that disagrees with its own rows.
+        page = status.to_html(status.compose(frontier, sink))
+        embedded = re.search(
+            r'<script id="data" type="application/json">(.*?)</script>',
+            page, re.S).group(1)
+        grid = json.loads(embedded.replace("<\\/", "</"))
+        assert set(grid) == {"generated_at", "summary", "agencies"}
+        assert grid["summary"]["recent_days"] == status.RECENT_DAYS
+
+    def test_a_closing_script_tag_in_the_data_cannot_end_the_block(self):
+        # A newsroom URL is entirely capable of carrying one, and it would end
+        # the JSON block early and render the rest of the payload as markup.
+        grid = {"generated_at": "2026-08-30 12:00:00", "summary": {},
+                "agencies": [{"a_id": 1, "domain": "x.org",
+                              "newsroom_url": "https://x.org/</script><b>"}]}
+        page = status.render_view(grid)
+
+        block = page.split('<script id="data" type="application/json">', 1)[1]
+        block = block.split("</script>", 1)[0]
+        assert "<\\/script>" in block, "the sequence must be inert"
+        assert json.loads(block.replace("<\\/", "</"))["agencies"][0]["a_id"] == 1
+
+    def test_the_note_is_escaped_the_same_way(self):
+        # It is the other thing substituted in, so it is the other way the block
+        # can be ended early.
+        page = status.render_view({"agencies": []}, note="see </script> below")
+        assert "</script> below" not in page
+
+    def test_a_payload_from_anywhere_renders(self):
+        """The point of the whole arrangement: the fetch does not matter.
+
+        This payload never touched the frontier, the sink, or MySQL - it is the
+        shape `scrapev3_grid()` returns in PHP, hand-written here.
+        """
+        grid = {
+            "generated_at": "2026-08-30 12:00:00",
+            "summary": {"total": 1, "health": {"empty": 1},
+                        "severity": {"error": 0, "warn": 1, "ok": 0},
+                        "updated_at": "2026-08-30 12:00:00"},
+            "agencies": [{"a_id": 7, "domain": "x.org", "health": "empty",
+                          "severity": "warn", "targets": 1, "targets_cached": 0}],
+        }
+        page = status.render_view(grid, note="from the fixture")
+        assert "from the fixture" in page
+        assert not re.findall(r"__[A-Z]+__", page)
 
 
 class TestRemovalReachesTheGrid:

@@ -264,6 +264,35 @@ class Sink:
         return {int(a_id): (int(total), int(recent or 0), published, seen)
                 for a_id, total, recent, published, seen in rows}
 
+    def inventory_stats(self) -> dict[int, tuple[str | None, int, int]]:
+        """Per-agency first-stored date and how far its articles got.
+
+        Returns a_id -> (earliest first_seen_at, loaded, pending).
+
+        Separate from `article_stats` because it answers a different question
+        and one of the two is cheap to want without the other: that one says
+        whether the newsroom is alive, this one says whether what we took from
+        it reached `tns.press_release`. Stored-but-never-loaded is a third
+        silent failure alongside `empty` - we reached the site, extraction
+        worked, and nothing landed - and it is invisible in every count above.
+
+        `pending` is everything not `loaded`, `rejected` included: a row we
+        decided will never load still did not land, and folding it into the
+        loaded count would report success for it.
+
+        Timestamps come back as the stored ISO string, for the same reason as
+        `article_stats` - one parser (`status._as_dt`) knows all three formats.
+        """
+        rows = self.db.execute(
+            "SELECT a_id, MIN(first_seen_at), "
+            "       SUM(CASE WHEN tns_state = 'loaded' THEN 1 ELSE 0 END), "
+            "       SUM(CASE WHEN tns_state IS NULL OR tns_state != 'loaded' "
+            "                THEN 1 ELSE 0 END) "
+            "FROM article WHERE a_id IS NOT NULL GROUP BY a_id"
+        ).fetchall()
+        return {int(a_id): (first, int(loaded or 0), int(pending or 0))
+                for a_id, first, loaded, pending in rows}
+
     def remove_agency(self, a_id: int) -> int:
         """Delete one agency's rows from the dedup index.
 

@@ -514,11 +514,20 @@ class Frontier(ABC):
         renders its articles with JavaScript does so for the whole site - so it
         is joined in rather than duplicated. LEFT, so a target seeded but never
         leased still gets a row instead of vanishing from the grid.
+
+        The first nine columns are positional in `status.compose`, so anything
+        new goes on the end. The tail is the cached-discovery and scheduling
+        state: whether this target is solved and how, whether a conditional GET
+        is armed, and when the schedule comes back for it. Selected here rather
+        than in a second query because this one already scans every target.
         """
         return self._execute(
             "SELECT t.a_id, t.domain, t.newsroom_url, t.enabled, "
             "       t.discovery_method, t.last_success_at, t.consec_failures, "
-            "       t.p50_body_len, d.needs_browser "
+            "       t.p50_body_len, d.needs_browser, "
+            "       t.feed_url, t.feed_absent, t.probed_at, t.etag, "
+            "       t.last_modified, d.next_allowed_at, d.crawl_delay_s, "
+            "       d.revisit_period_s "
             "FROM target t LEFT JOIN domain_state d ON d.domain = t.domain "
             "ORDER BY t.a_id, t.newsroom_url")
 

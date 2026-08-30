@@ -14,6 +14,7 @@ prints, or renders.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 import pymysql
@@ -28,10 +29,104 @@ COLUMNS = (
     "a_id", "domain", "newsroom_url", "enabled", "health", "severity", "reason",
     "discovery_method", "targets", "consec_failures", "needs_browser",
     "articles", "articles_recent", "median_body_len", "last_success_at",
-    "last_article_at", "updated_at",
+    "last_article_at",
+    # The inventory half: not the verdict on the agency, but the plan for it -
+    # whether discovery is solved, when we last actually pulled a document, and
+    # when the schedule comes back.
+    "targets_cached", "feed_url", "feed_absent", "probed_at", "conditional_get",
+    "next_due_at", "crawl_delay_s", "revisit_period_s", "first_stored_at",
+    "last_stored_at", "tns_loaded", "tns_pending",
+    "updated_at",
 )
 _COLUMN_LIST = ", ".join(COLUMNS)
-_ORDER = "ORDER BY FIELD(severity, 'error', 'warn', 'ok'), articles DESC, a_id"
+
+# Worst first, and the default when nobody asks for anything else. FIELD()
+# rather than a plain sort on `severity`, because alphabetical reads
+# "error, ok, warn" - the one order in which the broken sites are not first.
+_RANK = "FIELD(severity, 'error', 'warn', 'ok')"
+_ORDER = f"ORDER BY {_RANK}, articles DESC, a_id"
+
+# Any column may be sorted on, and only a column may be: the name is checked
+# against this set and never interpolated from what a caller sent. A query
+# string is the usual source of a sort key, so this is the one place user input
+# gets near the SQL.
+SORTABLE = frozenset(COLUMNS)
+
+
+def order_by(sort: str | None = None, desc: bool = False) -> str:
+    """The ORDER BY clause for a sort key, or the default worst-first one.
+
+    Three things it guarantees, all of which matter on real data:
+
+    * **Nulls last in both directions.** MySQL puts them first ascending, and
+      "never pulled a document" is not the smallest date - it is the absence of
+      one, and it belongs at the bottom either way.
+    * **A total order.** `a_id` breaks every tie, always ascending. Sorting by
+      `health` leaves two thousand rows tied, and without a tiebreak the same
+      page-2 query can return rows that were already on page 1.
+    * **`severity` sorts by rank, not alphabetically**, for the reason above.
+    """
+    if sort is None:
+        return _ORDER
+    if sort not in SORTABLE:
+        raise ValueError(f"not a sortable column: {sort!r}")
+    key = _RANK if sort == "severity" else sort
+    direction = "DESC" if desc else "ASC"
+    return f"ORDER BY ({sort} IS NULL), {key} {direction}, a_id"
+
+
+def _sortable(value: Any) -> Any:
+    """Compare text the way the database does, not the way Python does.
+
+    `agency_status` is utf8mb4_0900_ai_ci, so MySQL treats "A" and "a" as the
+    same letter. Python does not - `"Z" < "a"` is true on codepoints - so the
+    two orderings diverge the moment a value carries a capital. 250 of the
+    newsroom URLs do (`navy.mil/Press-Office`, `centcom.mil/MEDIA`), and the
+    live rows and the fixture rows would come back in different orders on the
+    same page, intermittently, depending on which hosts happened to collide.
+
+    Case is folded here; accents are not. `ai` also equates "e" and "é", which
+    would need full Unicode collation to reproduce - out of proportion for
+    columns holding hostnames, URLs and English sentences.
+    """
+    return value.lower() if isinstance(value, str) else value
+
+
+def sort_rows(rows: list[dict], sort: str | None = None,
+              desc: bool = False) -> list[dict]:
+    """The same order as `order_by`, applied in Python.
+
+    For the no-database path: rows read from a JSON fixture have not been
+    through MySQL and still have to come out in the order the site would get
+    live. `tests/test_client_contract.py` runs both against the same rows and
+    requires them to agree - two orderings that differ only sometimes is worse
+    than either one.
+    """
+    if sort is not None and sort not in SORTABLE:
+        raise ValueError(f"not a sortable column: {sort!r}")
+
+    if sort is None:
+        rank = {s: i for i, s in enumerate(SEVERITIES)}
+        return sorted(rows, key=lambda r: (rank.get(r.get("severity"), 9),
+                                           -(r.get("articles") or 0),
+                                           r.get("a_id")))
+
+    present = [r for r in rows if r.get(sort) is not None]
+    absent = [r for r in rows if r.get(sort) is None]
+
+    if sort == "severity":
+        rank = {s: i for i, s in enumerate(SEVERITIES)}
+        key = lambda r: rank.get(r.get("severity"), 9)          # noqa: E731
+    else:
+        key = lambda r: _sortable(r.get(sort))                  # noqa: E731
+
+    # Two stable passes rather than one compound key: `reverse=True` would flip
+    # the tiebreak as well, and `a_id` ascending is what the SQL does in both
+    # directions.
+    present.sort(key=lambda r: r.get("a_id"))
+    present.sort(key=key, reverse=desc)
+    absent.sort(key=lambda r: r.get("a_id"))
+    return present + absent
 
 
 def connect(host: str, user: str, password: str, *, port: int = 3306,
@@ -48,21 +143,34 @@ def connect(host: str, user: str, password: str, *, port: int = 3306,
 
 def statuses(conn: Any, *, severity: str | None = None, health: str | None = None,
              domain: str | None = None, search: str | None = None,
+             uncached: bool = False, due: bool = False,
+             sort: str | None = None, desc: bool = False,
              limit: int | None = None) -> list[dict]:
-    """Every agency's status, worst first."""
+    """Every agency's status, worst first unless `sort` says otherwise.
+
+    `sort` is a column name - see `SORTABLE`. Anything else raises rather than
+    reaching the SQL.
+    """
     where, params = [], []
     for column, value in (("severity", severity), ("health", health),
                           ("domain", domain)):
         if value:
             where.append(f"{column} = %s")
             params.append(value)
+    # Not a health word, and deliberately not derived from one: an agency can be
+    # perfectly healthy and still own a newsroom the cascade has never solved.
+    if uncached:
+        where.append("targets_cached < targets")
+    if due:
+        where.append("enabled = 1 AND (next_due_at IS NULL "
+                     "OR next_due_at <= UTC_TIMESTAMP())")
     if search:
         where.append("(domain LIKE %s OR newsroom_url LIKE %s)")
         params += [f"%{search}%", f"%{search}%"]
 
     sql = (f"SELECT {_COLUMN_LIST} FROM agency_status"
            + (" WHERE " + " AND ".join(where) if where else "")
-           + f" {_ORDER}")
+           + " " + order_by(sort, desc))
     if limit is not None:
         sql += " LIMIT %s"
         params.append(max(1, int(limit)))
@@ -126,8 +234,18 @@ def summary(conn: Any) -> dict:
 
 def grid(conn: Any, **filters: Any) -> dict:
     """Rows plus the counts above them, in the same shape as
-    `scrapev3 status --json`."""
-    return {"summary": summary(conn), "agencies": statuses(conn, **filters)}
+    `scrapev3 status --json`.
+
+    `generated_at` is when this was read, which is not `summary["updated_at"]` -
+    that is when the crawler last wrote a row. A page needs both: one says how
+    fresh the query is, the other says how fresh the data is, and a batch job
+    that stopped running only moves the first.
+    """
+    return {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "summary": summary(conn),
+        "agencies": statuses(conn, **filters),
+    }
 
 
 def _cast(row: dict) -> dict:
@@ -137,10 +255,13 @@ def _cast(row: dict) -> dict:
     often enough to be worth fixing once here rather than at each call site.
     """
     row = dict(row)
-    for key in ("enabled", "needs_browser"):
+    for key in ("enabled", "needs_browser", "feed_absent", "conditional_get"):
         if key in row:
             row[key] = bool(row[key])
-    for key in ("last_success_at", "last_article_at", "updated_at"):
+    if row.get("crawl_delay_s") is not None:
+        row["crawl_delay_s"] = float(row["crawl_delay_s"])
+    for key in ("last_success_at", "last_article_at", "probed_at", "next_due_at",
+                "first_stored_at", "last_stored_at", "updated_at"):
         value = row.get(key)
         if value is not None and hasattr(value, "isoformat"):
             row[key] = value.isoformat(sep=" ", timespec="seconds")

@@ -48,6 +48,11 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# The status page is data, not code, and `clients/status_demo.php` renders the
+# same file - so it has to survive being installed, not just run from the tree.
+[tool.setuptools.package-data]
+scrapev3 = ["*.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

@@ -320,6 +320,25 @@ def _cmd_frontier_seed(args: argparse.Namespace) -> int:
     # CSV is derived from v2's export and is regenerated, so editing it would
     # not survive either.
     settings = Settings.load()
+
+    # Requested sites are seeded from the same pass as the CSV, because they are
+    # the same kind of thing: a target somebody wants crawled. They go in first
+    # so the removal filter below applies to them too - a request must not be a
+    # way around the tombstone list.
+    requested = 0
+    if settings.requests_enabled:
+        from . import site_requests
+        from .urls import canonical_url as _canon, registrable_domain as _reg
+
+        have = {r[1] for r in rows}
+        for a_id, raw in site_requests.pending(settings):
+            url = _canon(raw)
+            dom = _reg(url) if url else ""
+            if url and dom and url not in have:
+                rows.append((a_id, url, dom))
+                have.add(url)
+                requested += 1
+
     skipped = 0
     if settings.removal_enabled:
         removed = _removed_agency_ids(settings)
@@ -336,6 +355,8 @@ def _cmd_frontier_seed(args: argparse.Namespace) -> int:
         store.close()
 
     console.print(f"Seeded [bold]{n}[/bold] targets ({len({d for _, _, d in rows})} distinct domains)")
+    if requested:
+        console.print(f"[dim]{requested} of them came from the shared request list[/dim]")
     if skipped:
         console.print(f"[dim]Skipped {skipped} target(s) whose agency has been removed[/dim]")
     _print_frontier_stats(stats)
@@ -363,6 +384,15 @@ def _cmd_status(args: argparse.Namespace) -> int:
         rows = [r for r in rows if r.health == args.health]
     if args.domain:
         rows = [r for r in rows if r.domain == args.domain]
+    # Not a health word: an agency can be perfectly healthy and still have a
+    # newsroom the cascade has never solved, and that is exactly the list worth
+    # looking at when deciding what needs work.
+    if args.uncached:
+        rows = [r for r in rows if r.targets_cached < r.targets]
+    if args.due:
+        now = datetime.utcnow()
+        rows = [r for r in rows
+                if r.enabled and (r.next_due_at is None or r.next_due_at <= now)]
 
     if args.json is not None:
         payload = status_mod.to_json(rows)
@@ -371,6 +401,15 @@ def _cmd_status(args: argparse.Namespace) -> int:
         else:
             Path(args.json).write_text(payload, encoding="utf-8")
             console.print(f"Wrote {len(rows)} agencies to {args.json}")
+        return 0
+
+    if args.html is not None:
+        path = Path(args.html)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(status_mod.to_html(rows), encoding="utf-8")
+        console.print(f"Wrote {len(rows)} agencies to {path}")
+        # Self-contained on purpose: no server to start, and file:// works.
+        console.print(f"[dim]Open it directly: {path.resolve().as_uri()}[/dim]")
         return 0
 
     if args.publish:
@@ -428,16 +467,51 @@ def _print_status(rows, summary: dict, *, limit: int) -> None:
     t.add_column("Source")
     t.add_column("Articles", justify="right")
     t.add_column(f"Last {RECENT_DAYS}d", justify="right")
+    t.add_column("Pulled")
+    t.add_column("Next due")
     t.add_column("Why", overflow="fold")
     for r in rows[:limit]:
         style = _SEVERITY_STYLE.get(r.severity, "white")
         t.add_row(str(r.a_id), r.domain, f"[{style}]{r.health}[/{style}]",
-                  r.discovery_method or "-", str(r.articles),
-                  str(r.articles_recent), r.reason or "")
+                  _source(r), str(r.articles), str(r.articles_recent),
+                  _ago(r.last_stored_at), _ago(r.next_due_at),
+                  r.reason or "")
     console.print(t)
     if len(rows) > limit:
         console.print(f"[dim]{len(rows) - limit} more; raise --limit or filter "
-                      f"with --severity / --health.[/dim]")
+                      f"with --severity / --health / --uncached.[/dim]")
+
+
+def _source(row) -> str:
+    """The cached discovery method, and whether it covers the whole agency.
+
+    An agency with three newsrooms where one is solved is not solved, and
+    printing just the winning method would say it was.
+    """
+    if not row.discovery_method:
+        return "[dim]not solved[/dim]"
+    if row.targets_cached < row.targets:
+        return f"{row.discovery_method} [dim]({row.targets_cached}/{row.targets})[/dim]"
+    return row.discovery_method
+
+
+def _ago(when) -> str:
+    """A date as distance from now, signed, because both directions happen.
+
+    `last_stored_at` is always in the past and `next_due_at` usually is not, and
+    "in 4h" reads at a glance where a bare timestamp does not.
+    """
+    if when is None:
+        return "[dim]-[/dim]"
+    delta = when - datetime.utcnow()
+    seconds = abs(delta.total_seconds())
+    if seconds < 3600:
+        size = f"{int(seconds // 60)}m"
+    elif seconds < 86400:
+        size = f"{int(seconds // 3600)}h"
+    else:
+        size = f"{int(seconds // 86400)}d"
+    return f"in {size}" if delta.total_seconds() > 0 else f"{size} ago"
 
 
 def _removed_agency_ids(settings: Settings) -> set[int]:
@@ -553,6 +627,98 @@ def _print_removals(reports, requested: set[int]) -> int:
     console.print("[dim]The JSONL archive was rewritten; that part cannot be "
                   "undone.[/dim]")
     return 0
+
+
+def _cmd_request(args: argparse.Namespace) -> int:
+    """Add a site to the shared request list, and seed it into the frontier."""
+    from . import removal, site_requests
+    from .frontier import open_frontier
+
+    settings = Settings.load()
+    try:
+        conn = site_requests.connect(settings)
+    except Exception as exc:                                # noqa: BLE001
+        console.print(f"[red]Cannot reach the request list:[/red] {exc}")
+        console.print("[dim]It lives in MySQL - set SCRAPEV3_MYSQL_HOST in .env[/dim]")
+        return 2
+
+    try:
+        site_requests.ensure_table(conn)
+
+        if args.list:
+            entries = site_requests.rows(conn)
+            if not entries:
+                console.print("[dim]No sites have been requested.[/dim]")
+                return 0
+            t = Table(title="Requested sites", header_style="bold")
+            t.add_column("a_id", justify="right")
+            t.add_column("Newsroom URL", overflow="fold")
+            t.add_column("Requested at")
+            t.add_column("Note", overflow="fold")
+            for a_id, url, when, note in entries:
+                t.add_row(str(a_id), url, str(when), note or "")
+            console.print(t)
+            return 0
+
+        if args.drop:
+            if args.a_id is None:
+                console.print("[red]--drop needs --a-id.[/red]")
+                return 2
+            dropped = site_requests.drop(conn, args.a_id, args.url)
+            console.print(
+                f"Took {dropped} request(s) for a_id {args.a_id} off the list."
+                if dropped else
+                f"[yellow]a_id {args.a_id} had nothing on the list.[/yellow]")
+            console.print("[dim]Anything already seeded stays in the frontier. "
+                          "Use `scrapev3 remove` to take it out.[/dim]")
+            return 0
+
+        if args.a_id is not None:
+            if not args.url:
+                console.print("[red]--a-id needs --url.[/red] "
+                              "[dim]The frontier's unit is the newsroom URL[/dim]")
+                return 2
+            site_requests.add(conn, args.a_id, args.url, args.note)
+
+        if args.apply:
+            wanted = site_requests.listed(conn)
+        elif args.a_id is not None:
+            wanted = [(args.a_id, args.url)]
+        else:
+            console.print("[red]Nothing to do.[/red] [dim]Give --a-id and --url, "
+                          "or --apply to reconcile the whole list[/dim]")
+            return 2
+
+        # Read inside the same connection: the removal list is the authority on
+        # what must not come back, and checking it here is what stops a request
+        # from undoing a removal the website also asked for.
+        removal.ensure_table(conn)
+        removed = removal.listed(conn)
+    finally:
+        conn.close()
+
+    frontier = open_frontier()
+    try:
+        report = site_requests.reconcile(wanted, frontier=frontier, removed=removed)
+        stats = frontier.stats()
+    finally:
+        frontier.close()
+
+    _print_requests(report)
+    _print_frontier_stats(stats)
+    return 0
+
+
+def _print_requests(report) -> None:
+    console.print(f"Seeded [bold]{report.seeded}[/bold] requested target(s)")
+    if report.refused:
+        console.print(f"[yellow]Refused {len(report.refused)}[/yellow] whose agency "
+                      f"is on the removal list: "
+                      f"{', '.join(str(a) for a in sorted(set(report.refused)))}")
+        console.print("[dim]A removal outranks a request. Use "
+                      "`scrapev3 remove --restore A_ID` first if that is wrong.[/dim]")
+    for url in report.invalid:
+        console.print(f"[red]No usable domain:[/red] {url}")
 
 
 def _print_frontier_stats(s) -> None:
@@ -1534,6 +1700,24 @@ def main(argv: list[str] | None = None) -> int:
                                "anything already deleted; re-seed for that")
     p_remove.set_defaults(func=_cmd_remove)
 
+    p_request = sub.add_parser(
+        "request",
+        help="Add a site on request: seed the shared list into the frontier.")
+    p_request.add_argument("--a-id", type=int, default=None,
+                           help="The agency the newsroom belongs to")
+    p_request.add_argument("--url", default=None,
+                           help="The newsroom URL to crawl")
+    p_request.add_argument("--note", default=None,
+                           help="Why, recorded on the shared list")
+    p_request.add_argument("--list", action="store_true",
+                           help="Show the sites already requested")
+    p_request.add_argument("--apply", action="store_true",
+                           help="Reconcile the whole list now, without crawling")
+    p_request.add_argument("--drop", action="store_true",
+                           help="Take a request off the list (needs --a-id). "
+                                "Does NOT un-seed it; use `remove` for that")
+    p_request.set_defaults(func=_cmd_request)
+
     p_status = sub.add_parser(
         "status",
         help="Per-agency health, for the website's grid. Read-only unless --publish.")
@@ -1543,6 +1727,15 @@ def main(argv: list[str] | None = None) -> int:
                           metavar="PATH",
                           help="Emit the same payload as JSON; '-' prints it. "
                                "Feeds clients/status_demo.php when there is no DB")
+    p_status.add_argument("--uncached", action="store_true",
+                          help="Only agencies with a newsroom discovery has "
+                               "never solved")
+    p_status.add_argument("--due", action="store_true",
+                          help="Only agencies the schedule will pick up next")
+    p_status.add_argument("--html", nargs="?", const="data/status.html",
+                          default=None, metavar="PATH",
+                          help="Write a standalone page (data embedded, no "
+                               "server needed) and print its file:// URL")
     p_status.add_argument("--severity", choices=["ok", "warn", "error"],
                           default=None, help="Only agencies in this band")
     p_status.add_argument("--health", default=None,

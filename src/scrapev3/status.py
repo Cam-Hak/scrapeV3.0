@@ -91,6 +91,18 @@ CREATE TABLE IF NOT EXISTS agency_status (
   median_body_len   INT NULL,
   last_success_at   DATETIME NULL,
   last_article_at   DATETIME NULL,
+  targets_cached    SMALLINT NOT NULL DEFAULT 0,
+  feed_url          TEXT NULL,
+  feed_absent       TINYINT(1) NOT NULL DEFAULT 0,
+  probed_at         DATETIME NULL,
+  conditional_get   TINYINT(1) NOT NULL DEFAULT 0,
+  next_due_at       DATETIME NULL,
+  crawl_delay_s     FLOAT NOT NULL DEFAULT 5.0,
+  revisit_period_s  INT NOT NULL DEFAULT 86400,
+  first_stored_at   DATETIME NULL,
+  last_stored_at    DATETIME NULL,
+  tns_loaded        INT NOT NULL DEFAULT 0,
+  tns_pending       INT NOT NULL DEFAULT 0,
   updated_at        DATETIME NOT NULL,
   PRIMARY KEY (a_id),
   KEY idx_status_severity (severity),
@@ -98,13 +110,44 @@ CREATE TABLE IF NOT EXISTS agency_status (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
 
+# `_DDL` is CREATE TABLE IF NOT EXISTS, so a table already out there never
+# gains a column from editing it. Anything added after the first deployment
+# belongs here too, keyed by column name so `_migrate` can add only what is
+# missing - the same shape as `sink._MIGRATIONS`, for the same reason.
+#
+# These twelve turn the row from a verdict into an inventory: is this agency's
+# discovery solved and by what, when did we last actually pull a document (as
+# opposed to when the publisher dated one), when does the schedule come back,
+# and did what we stored ever reach `tns.press_release`.
+_MIGRATIONS = (
+    ("targets_cached", "SMALLINT NOT NULL DEFAULT 0"),
+    ("feed_url", "TEXT NULL"),
+    ("feed_absent", "TINYINT(1) NOT NULL DEFAULT 0"),
+    ("probed_at", "DATETIME NULL"),
+    ("conditional_get", "TINYINT(1) NOT NULL DEFAULT 0"),
+    ("next_due_at", "DATETIME NULL"),
+    ("crawl_delay_s", "FLOAT NOT NULL DEFAULT 5.0"),
+    ("revisit_period_s", "INT NOT NULL DEFAULT 86400"),
+    ("first_stored_at", "DATETIME NULL"),
+    ("last_stored_at", "DATETIME NULL"),
+    ("tns_loaded", "INT NOT NULL DEFAULT 0"),
+    ("tns_pending", "INT NOT NULL DEFAULT 0"),
+)
+
 # Written and read by name, never by position: the website selects columns
 # explicitly, so a column added here cannot shift the meaning of another.
 COLUMNS = (
     "a_id", "domain", "newsroom_url", "enabled", "health", "severity", "reason",
     "discovery_method", "targets", "consec_failures", "needs_browser",
     "articles", "articles_recent", "median_body_len", "last_success_at",
-    "last_article_at", "updated_at",
+    "last_article_at",
+    # The inventory half: what the crawler knows about the plan for this site,
+    # rather than its verdict on it. Appended, never interleaved - a website
+    # selecting the original sixteen keeps working unchanged.
+    "targets_cached", "feed_url", "feed_absent", "probed_at", "conditional_get",
+    "next_due_at", "crawl_delay_s", "revisit_period_s", "first_stored_at",
+    "last_stored_at", "tns_loaded", "tns_pending",
+    "updated_at",
 )
 
 
@@ -128,19 +171,45 @@ class AgencyStatus:
     median_body_len: int | None = None
     last_success_at: datetime | None = None
     last_article_at: datetime | None = None
+
+    # A count, not a flag. An agency with three newsrooms where one is solved
+    # is not "cached", and a boolean would read as solved and hide the other
+    # two - `targets_cached < targets` is the condition worth branching on.
+    targets_cached: int = 0
+    feed_url: str | None = None
+    feed_absent: bool = False
+    probed_at: datetime | None = None
+    conditional_get: bool = False
+    next_due_at: datetime | None = None
+    crawl_delay_s: float = 5.0
+    revisit_period_s: int = 86400
+    first_stored_at: datetime | None = None
+
+    # Not `last_article_at`, which is the publisher's own date. This is when we
+    # last put a document in the index, and the two disagree in both directions
+    # that matter: a site republishing old items looks fresh by the first, and
+    # a site we quietly stopped storing looks fine by it too.
+    last_stored_at: datetime | None = None
+    tns_loaded: int = 0
+    tns_pending: int = 0
+
     updated_at: datetime | None = None
+
+    _BOOLS = ("enabled", "needs_browser", "feed_absent", "conditional_get")
+    _DATES = ("last_success_at", "last_article_at", "probed_at", "next_due_at",
+              "first_stored_at", "last_stored_at", "updated_at")
 
     def as_row(self) -> tuple:
         """Values in `COLUMNS` order, for the upsert."""
         d = asdict(self)
-        d["enabled"] = int(self.enabled)
-        d["needs_browser"] = int(self.needs_browser)
+        for key in self._BOOLS:
+            d[key] = int(d[key])
         return tuple(d[c] for c in COLUMNS)
 
     def as_dict(self) -> dict[str, Any]:
-        """JSON-safe, for `--json` and the demo page's fixture."""
+        """JSON-safe, for `--json` and the development page's fixture."""
         d = asdict(self)
-        for key in ("last_success_at", "last_article_at", "updated_at"):
+        for key in self._DATES:
             value = d[key]
             d[key] = value.isoformat(sep=" ", timespec="seconds") if value else None
         return d
@@ -167,16 +236,17 @@ def classify(*, enabled: bool, consec_failures: int, needs_browser: bool,
         return "disabled", "not being crawled"
     if last_success_at is None:
         return "never", ("never crawled successfully" if consec_failures == 0
-                         else f"never crawled successfully, {consec_failures} "
-                              f"attempt(s) failed")
+                         else "never crawled successfully, "
+                              + _plural(consec_failures, "attempt") + " failed")
     if consec_failures >= FAILING_AFTER:
-        return "failing", f"{consec_failures} crawls in a row failed"
+        return "failing", f"{_plural(consec_failures, 'crawl')} in a row failed"
     if needs_browser:
         return "blocked", "the page needs a browser to render its articles"
 
     success_age = (now - last_success_at).days
+    ago = _plural(success_age, "day")
     if success_age >= STALE_AFTER_DAYS:
-        return "stale", f"last crawled successfully {success_age} days ago"
+        return "stale", f"last crawled successfully {ago} ago"
 
     # Its own word rather than a flavour of `stale`, because it is a different
     # fault with a different fix. Stale means we stopped reaching the site;
@@ -191,8 +261,15 @@ def classify(*, enabled: bool, consec_failures: int, needs_browser: bool,
     if last_article_at is not None:
         article_age = (now - last_article_at).days
         if article_age >= QUIET_AFTER_DAYS:
-            return "quiet", f"crawling fine; nothing published for {article_age} days"
-    return "healthy", f"crawled successfully {success_age} days ago"
+            return "quiet", ("crawling fine; nothing published for "
+                             + _plural(article_age, "day"))
+    return "healthy", ("crawled successfully today" if success_age == 0
+                       else f"crawled successfully {ago} ago")
+
+
+def _plural(n: int, noun: str) -> str:
+    """"1 day", not "1 days". Small, but it is the text a person reads."""
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
 
 
 def compose(frontier: "Frontier", sink: "Sink", *,
@@ -207,6 +284,7 @@ def compose(frontier: "Frontier", sink: "Sink", *,
     """
     now = now or datetime.now(timezone.utc).replace(tzinfo=None)
     counts = sink.article_stats(since=now - timedelta(days=RECENT_DAYS))
+    landed = sink.inventory_stats()
 
     # One agency can own several newsroom URLs (2 of 2399 do), so the frontier's
     # per-target rows are folded together. Failures are MAXed, not summed: the
@@ -215,9 +293,13 @@ def compose(frontier: "Frontier", sink: "Sink", *,
     merged: dict[int, AgencyStatus] = {}
     for row in frontier.status_rows():
         (a_id, domain, newsroom_url, enabled, method, last_success,
-         failures, p50, needs_browser) = row
+         failures, p50, needs_browser,
+         feed_url, feed_absent, probed_at, etag, last_modified,
+         next_due, crawl_delay, revisit) = row
         a_id = int(a_id)
         last_success = _as_dt(last_success)
+        next_due = _as_dt(next_due)
+        conditional = bool(etag or last_modified)
 
         current = merged.get(a_id)
         if current is None:
@@ -228,20 +310,47 @@ def compose(frontier: "Frontier", sink: "Sink", *,
                 needs_browser=bool(needs_browser),
                 median_body_len=int(p50) if p50 is not None else None,
                 last_success_at=last_success,
+                targets_cached=1 if method else 0,
+                feed_url=feed_url, feed_absent=bool(feed_absent),
+                probed_at=_as_dt(probed_at), conditional_get=conditional,
+                next_due_at=next_due,
+                crawl_delay_s=float(crawl_delay if crawl_delay is not None else 5.0),
+                revisit_period_s=int(revisit if revisit is not None else 86400),
             )
             continue
 
         current.targets += 1
+        current.targets_cached += 1 if method else 0
         current.enabled = current.enabled or bool(enabled)
         current.needs_browser = current.needs_browser or bool(needs_browser)
         current.consec_failures = max(current.consec_failures, int(failures or 0))
+
+        # The soonest of the agency's domains, because that is when it next
+        # gets attention - and the slowest pace and longest gap any of them is
+        # held to, because reporting the fastest would understate what the
+        # crawler actually promises the publisher. Taking whichever domain
+        # happened to sort first would be a number nobody chose.
+        if next_due and (current.next_due_at is None
+                         or next_due < current.next_due_at):
+            current.next_due_at = next_due
+        if crawl_delay is not None:
+            current.crawl_delay_s = max(current.crawl_delay_s, float(crawl_delay))
+        if revisit is not None:
+            current.revisit_period_s = max(current.revisit_period_s, int(revisit))
+
         # The most recently successful target is the one whose method is worth
         # showing - a stale second newsroom should not overwrite the live one.
+        # Everything the cascade cached about that target travels with it, for
+        # the same reason: a feed URL from the dead newsroom is worse than none.
         if last_success and (current.last_success_at is None
                              or last_success > current.last_success_at):
             current.last_success_at = last_success
             current.discovery_method = method or current.discovery_method
             current.newsroom_url = newsroom_url
+            current.feed_url = feed_url
+            current.feed_absent = bool(feed_absent)
+            current.probed_at = _as_dt(probed_at)
+            current.conditional_get = conditional
 
     for status in merged.values():
         total, recent, last_article, last_stored = counts.get(
@@ -249,6 +358,12 @@ def compose(frontier: "Frontier", sink: "Sink", *,
         status.articles = total
         status.articles_recent = recent
         status.last_article_at = _as_dt(last_article)
+        status.last_stored_at = _as_dt(last_stored)
+
+        first_stored, loaded, pending = landed.get(status.a_id, (None, 0, 0))
+        status.first_stored_at = _as_dt(first_stored)
+        status.tns_loaded = loaded
+        status.tns_pending = pending
 
         # A stored article IS a successful crawl, and it is the only evidence
         # left when the frontier's timestamp is missing. That happens: articles
@@ -307,6 +422,10 @@ def summary(rows: list[AgencyStatus]) -> dict[str, Any]:
         "total": len(rows),
         "health": by_health,
         "severity": by_severity,
+        # So a consumer can label `articles_recent` truthfully. It is a crawler
+        # constant, and a website reading MySQL directly has no other way to
+        # learn it than to hardcode a number nobody will update.
+        "recent_days": RECENT_DAYS,
         "updated_at": updated.isoformat(sep=" ", timespec="seconds") if updated
                       else None,
     }
@@ -341,7 +460,29 @@ def connect(settings: Settings) -> Any:
 def ensure_table(conn: Any) -> None:
     with conn.cursor() as cur:
         cur.execute(_DDL)
+        _migrate(cur)
     conn.commit()
+
+
+def _migrate(cur: Any) -> list[str]:
+    """Add the columns an older table is missing. Returns what it added.
+
+    Reads what is there and adds only the difference, rather than running every
+    ALTER and swallowing "duplicate column". Catching that error would also
+    catch the ones worth hearing about - a bad type, a lost grant - and a
+    dashboard whose new columns silently never appeared reads exactly like one
+    where nothing has changed yet.
+    """
+    cur.execute("SHOW COLUMNS FROM agency_status")
+    have = {row[0] for row in cur.fetchall()}
+    added = []
+    for column, spec in _MIGRATIONS:
+        if column not in have:
+            cur.execute(f"ALTER TABLE agency_status ADD COLUMN {column} {spec}")
+            added.append(column)
+    if added:
+        log.info("agency_status: added %s", ", ".join(added))
+    return added
 
 
 def publish(conn: Any, rows: list[AgencyStatus]) -> int:
@@ -390,9 +531,8 @@ def prune(conn: Any, keep: Iterable[int]) -> int:
 def to_json(rows: list[AgencyStatus], *, indent: int = 2) -> str:
     """The same payload the website reads, as a file.
 
-    Written for `clients/status_demo.php`, which renders from this when no
-    database is configured - so the page can be opened and judged before any of
-    the wiring exists.
+    The reference for whoever writes the real grid: exact field names and
+    types, without needing a database connection to look at them.
     """
     payload = {
         "generated_at": datetime.now(timezone.utc).replace(
@@ -401,3 +541,63 @@ def to_json(rows: list[AgencyStatus], *, indent: int = 2) -> str:
         "agencies": [r.as_dict() for r in rows],
     }
     return json.dumps(payload, indent=indent)
+
+
+# ---------------------------------------------------------------------------
+# Looking at it locally
+# ---------------------------------------------------------------------------
+
+# One self-contained file: the data is embedded, the CSS and JS are inline, and
+# nothing is fetched. That is the point - it opens by double-clicking it, with
+# no web server, no PHP, and no browser refusing a file:// fetch of a sibling
+# JSON. Checking the numbers should not require standing anything up.
+# The page itself is `status_view.html`, next to this file, because it is not
+# only ours: `clients/status_demo.php` renders the same file from the same
+# payload. Two copies of the view - one here, one in PHP - drift, and the first
+# pair of them disagreed about which columns existed within a day of being
+# written. Whatever fetched the rows, the page is this one.
+_VIEW = "status_view.html"
+
+
+def view_template() -> str:
+    """The shared page, as text. Read at call time, never cached.
+
+    `importlib.resources` rather than a path relative to `__file__`, so it is
+    found the same way when the package is installed as when it is run from the
+    source tree.
+    """
+    from importlib import resources
+
+    return resources.files(__package__).joinpath(_VIEW).read_text(encoding="utf-8")
+
+
+def to_html(rows: list[AgencyStatus]) -> str:
+    """The whole grid as one standalone file, for looking at locally.
+
+    The equivalent of `show` or `frontier`: a way to see what the crawler
+    currently thinks, without standing anything up to see it. It opens by
+    double-clicking - no server, no PHP, nothing fetched.
+
+    The page is `status_view.html`, which `clients/status_demo.php` also renders
+    from the same payload. This function is only the local way of filling it.
+    """
+    # The same payload `--json` writes and `scrapev3_grid()` returns. The page
+    # builds its own header from it, so there is nothing else to substitute and
+    # no second place for a producer to get the header wrong.
+    return render_view(json.loads(to_json(rows)))
+
+
+def render_view(grid: dict[str, Any], note: str = "") -> str:
+    """The shared page, filled with one payload.
+
+    `grid` is `{generated_at, summary, agencies}`. `note` is an optional line
+    about where the rows came from, shown as a banner - a page that silently
+    falls back to stale data is one that will eventually be mistaken for a
+    working dashboard.
+    """
+    # A literal `</script>` inside the JSON would end the block early, and an
+    # article headline is entirely capable of containing one. Escaping the
+    # slash keeps the JSON valid and the sequence inert to the HTML parser.
+    payload = json.dumps(grid).replace("</", "<\\/")
+    return (view_template().replace("__DATA__", payload)
+                           .replace("__NOTE__", note.replace("</", "<\\/")))

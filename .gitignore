@@ -38,6 +38,11 @@ dist/
 logs/
 data/surveys/
 data/articles/
+# Rendered views of a crawl, not the crawl. Both are regenerated in one
+# command (`scrapev3 status --json` / `--html`) and status.html is a
+# megabyte of embedded rows that changes on every pass.
+data/status.json
+data/status.html
 *.sqlite
 *.db
 # SQLite write-ahead log and shared-memory files. Transient state that every

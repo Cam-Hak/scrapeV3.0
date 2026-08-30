@@ -41,8 +41,13 @@ scrapev3 tns status | tns backfill [--resync] | tns show --full
 scrapev3 reset --a-id 22385 --tns        # forget one agency across all stores
 scrapev3 remove --a-id 22385             # honour a removal request, permanently
 scrapev3 remove --list | remove --apply  # the shared list; reconcile it now
+scrapev3 request --a-id 22385 --url https://x.org/news   # honour an add request
+scrapev3 request --list | request --apply       # the shared list; reconcile it now
 scrapev3 status --health empty           # per-agency health; --publish for the website
-scrapev3 status --json clients/sample_status.json   # refresh the demo page's fixture
+scrapev3 status --uncached --limit 40    # newsrooms discovery has never solved
+scrapev3 status --json data/status.json  # refresh the demo page's fixture
+scrapev3 status --html                   # standalone page, no server; data/status.html
+php -S localhost:8000 -t clients         # then /status_demo.php - same page, live rows
 
 python scripts/extract_sites.py          # scrape_test.csv -> data/sites.{csv,txt}
 python scripts/validate_targets.py run --limit 100   # end-to-end stored-article sweep
@@ -74,7 +79,8 @@ nothing on a daily re-crawl.
 | [urls.py](src/scrapev3/urls.py) | `registrable_domain`, `canonical_url`, `classify_url`, `is_non_news_path` |
 | [audit.py](src/scrapev3/audit.py) | Scores discovery output for plausibility without fetching articles |
 | [removal.py](src/scrapev3/removal.py) | Purges one `a_id` from every store; owns the shared removal list |
-| [status.py](src/scrapev3/status.py) | Per-agency health for the website's grid; `classify` is pure |
+| [status.py](src/scrapev3/status.py) | Per-agency health *and* inventory for the website's grid; `classify` is pure |
+| [site_requests.py](src/scrapev3/site_requests.py) | Seeds one `a_id`+URL from the shared request list; mirror of `removal.py` |
 | [tracing.py](src/scrapev3/tracing.py) | `--debug` decision logging, printed through the progress bar's Console |
 
 **The queue hands out domain leases, not URLs.** That is the load-bearing
@@ -116,6 +122,48 @@ feed/wp-json bodies are `FEED`/`CMS_API`, not `TRAFILATURA`.
   `data/articles.sqlite` (dedup — `seen_url` runs before the fetch, so skipping it
   makes a re-run silently store nothing), and the frontier calendar. `reset --tns`
   does all three. Don't reach for `crawl --refetch` while the MySQL rows still exist.
+- **`requested_site` is the mirror of `removed_agency`, and a removal outranks
+  it.** The website can insert into both, so it can ask for two incompatible
+  things. A request whose `a_id` is on the removal list is refused on *every*
+  pass and the refusal is counted - without that rule the crawler purges the
+  agency, re-seeds it from the request list next pass, and purges it again
+  forever, so a publisher who asked to be removed silently stays in the crawl.
+  Reconciled, not drained, for the same reason as removals. Keyed on
+  `newsroom_url` alone, exactly like `target`: the frontier cannot hold one URL
+  under two agencies, and VARCHAR(768) utf8mb4 is already InnoDB's whole 3072-byte
+  key limit. There is deliberately no `domain` column - the crawler derives it,
+  since that value is its pacing and shard key. Off unless `SCRAPEV3_REQUESTS=on`.
+- **The website's sort has to be a total order, and has to match the fixture.**
+  `clients/status.{php,py}` build every `ORDER BY` through one whitelist:
+  nulls last in both directions (MySQL puts them first ascending), `a_id` as an
+  unconditional tiebreak (sorting by `health` leaves 2,000 rows tied, and
+  without it paging repeats and skips rows), and `severity` by `FIELD()` rank
+  rather than alphabetically. `sort_rows` reproduces it for a site reading the
+  JSON fixture and **folds case**, because the table is `utf8mb4_0900_ai_ci`
+  while Python and PHP compare bytes - 250 newsroom URLs carry a capital, and
+  the two paths disagreed before it did. Verified against the live grid: 58
+  column/direction pairs, 24 filter/sort combinations and 4 paging tilings.
+- **One page, whatever fetched the rows.** `src/scrapev3/status_view.html` is
+  rendered by both `scrapev3 status --html` (pymysql) and
+  `clients/status_demo.php` (PDO, or a JSON fixture), from the same
+  `{generated_at, summary, agencies}` payload. Producers substitute `__DATA__`
+  and `__NOTE__` and nothing else - the page builds its own header from the
+  payload. Two renderers kept in step by hand drift exactly like two definitions
+  of "healthy" would, and the first pair here disagreed about which columns
+  existed within a day. The template ships as package data (`pyproject.toml`),
+  so it survives being installed.
+- **`agency_status` carries the verdict and the inventory, in one row.** A
+  parallel table keyed on the same `a_id`, written by the same pass from the
+  same two stores, would only buy a join and a way to be half-published. The
+  columns are appended, never interleaved, and both clients select by name, so
+  widening it does not break a website nobody has redeployed - but `_DDL` is
+  `CREATE TABLE IF NOT EXISTS`, so **anything added after the first deployment
+  must also go in `_MIGRATIONS`** or it appears only on new installs.
+  `tests/test_status.py` pins that the two lists agree. Two distinctions carry
+  weight here as well: `last_stored_at` (when *we* pulled a document) is not
+  `last_article_at` (the publisher's own date), and `tns_pending` - stored
+  locally, never landed in `press_release` - is a third silent failure that
+  every count above it reports as fine.
 - **`reset` and `remove` are different operations.** `reset` un-does a test run;
   the agency stays in the frontier and comes back on the next crawl. `remove`
   honours a publisher's request: it purges the `a_id` everywhere *and* records it

@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>scrapev3 crawl status</title>
+<!--
+  The grid, once. Whatever fetched the rows - pymysql in `scrapev3 status
+  --html`, PDO in `clients/status_demo.php`, or a JSON file in either - hands
+  this file the same payload and gets the same page. Two renderers kept in step
+  by hand would drift, and they did: the first pair of them disagreed about
+  which columns existed within a day of being written.
+
+  The contract is `{generated_at, summary, agencies}` - the shape of
+  `scrapev3 status --json` and of `scrapev3_grid()` alike. Substitute it into
+  __DATA__ and optionally put a line about where it came from in __NOTE__.
+  Nothing else in this file is filled in from outside.
+
+  Two audiences read this page and they want different things. Someone checking
+  whether a publisher is being collected wants six columns and a sentence;
+  someone debugging the cascade wants the cached feed URL and the failure
+  counter. So the columns carry a tier, the toggle switches between them, and
+  clicking a row shows every field in the payload. One table, three depths.
+-->
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fff; --fg: #1f2328; --dim: #59636e; --line: #d1d9e0;
+    --ok: #1a7f37; --warn: #9a6700; --error: #b3261e; --chip: #f6f8fa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --fg: #e6edf3; --dim: #9198a1; --line: #3d444d;
+      --ok: #3fb950; --warn: #d29922; --error: #f85149; --chip: #161b22;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--fg); margin: 0;
+         font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1320px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+  h1 { font-size: 1.35rem; margin: 0 0 .3rem; }
+  .meta { color: var(--dim); margin: 0 0 1.5rem; }
+  .note { border-left: 3px solid var(--warn); background: var(--chip);
+          padding: .6rem .9rem; margin: 0 0 1.25rem; border-radius: 3px; }
+  .chips { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: 1rem;
+           align-items: center; }
+  .chip { border: 1px solid var(--line); background: var(--chip); color: inherit;
+          border-radius: 999px; padding: .25rem .85rem; cursor: pointer;
+          font: inherit; font-size: .85rem; }
+  .chip[aria-pressed="true"] { border-color: currentColor; font-weight: 600; }
+  .chip .n { color: var(--dim); font-weight: 400; }
+  .chip[aria-pressed="true"] .n { color: inherit; }
+  .spacer { flex: 1; }
+  .depth { border: 1px solid var(--line); background: var(--bg); color: inherit;
+           border-radius: 5px; padding: .25rem .85rem; cursor: pointer;
+           font: inherit; font-size: .85rem; }
+  .depth[aria-pressed="true"] { background: var(--chip); font-weight: 600; }
+  input[type=search] { padding: .4rem .6rem; border: 1px solid var(--line);
+                       border-radius: 5px; min-width: 20rem; margin-bottom: 1rem;
+                       background: var(--bg); color: inherit; font: inherit; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: .45rem .6rem; vertical-align: top;
+           border-bottom: 1px solid var(--line); }
+  th { font-size: .72rem; text-transform: uppercase; letter-spacing: .04em;
+       color: var(--dim); border-bottom-width: 2px; cursor: pointer;
+       white-space: nowrap; }
+  th[aria-sort] { color: inherit; }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.row { cursor: pointer; }
+  tr.row:hover > td { background: var(--chip); }
+  .dot { display: inline-block; width: .6rem; height: .6rem;
+         border-radius: 50%; margin-right: .4rem; }
+  .health { white-space: nowrap; font-weight: 600; }
+  .when { white-space: nowrap; }
+  .domain { font-weight: 600; }
+  .url, .why { color: var(--dim); font-size: .85rem; }
+  .url { word-break: break-all; }
+  .muted { color: var(--dim); }
+  /* Every field in the payload, for one agency. */
+  .detail td { background: var(--chip); padding: .9rem 1.2rem; }
+  .fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
+            gap: .35rem 1.5rem; margin: 0; }
+  .fields div { display: flex; justify-content: space-between; gap: 1rem;
+                border-bottom: 1px dotted var(--line); padding: .15rem 0; }
+  .fields dt { color: var(--dim); font-size: .85rem; }
+  .fields dd { margin: 0; font-variant-numeric: tabular-nums;
+               text-align: right; word-break: break-all; }
+  .none { padding: 2rem 0; color: var(--dim); }
+  footer { margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid var(--line);
+           color: var(--dim); font-size: .85rem; }
+  code { background: var(--chip); padding: .1rem .3rem; border-radius: 3px; }
+</style>
+<main>
+  <h1>Crawl status</h1>
+  <p class="meta" id="meta"></p>
+  <div id="note"></div>
+
+  <div class="chips" id="chips"></div>
+  <input type="search" id="q" placeholder="Filter by domain, a_id or reason"
+         autocomplete="off">
+
+  <table>
+    <thead><tr id="head"></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p class="none" id="none" hidden>Nothing matches that filter.</p>
+
+  <footer id="footer"></footer>
+</main>
+
+<script id="data" type="application/json">__DATA__</script>
+<script id="note-text" type="text/plain">__NOTE__</script>
+<script>
+// The whole payload, not just the rows: `summary` and `generated_at` are part
+// of the contract and the header is built from them rather than substituted in,
+// so every producer gets the same header without writing one.
+const GRID = JSON.parse(document.getElementById('data').textContent);
+const ALL = GRID.agencies || [];
+const SUMMARY = GRID.summary || {};
+// The crawler's window for `articles_recent`. A producer that cannot know it -
+// a site reading MySQL directly - omits it and gets the default rather than a
+// column labelled with a number nobody checked.
+const RECENT = SUMMARY.recent_days || 30;
+const COLOUR = { ok: 'var(--ok)', warn: 'var(--warn)', error: 'var(--error)' };
+
+function esc(v) {
+  return String(v === null || v === undefined ? '' : v)
+    .replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+// Signed, because both directions happen: `last_stored_at` is always behind and
+// `next_due_at` usually is not, and a helper that only counts backwards renders
+// every waiting site as though it were overdue.
+function ago(ts) {
+  if (!ts) return 'never';
+  const at = Date.parse(String(ts).replace(' ', 'T') + 'Z');
+  if (isNaN(at)) return 'never';
+  const delta = at - Date.now(), size = Math.abs(delta);
+  if (size < 6e4) return 'now';
+  const text = size < 36e5 ? Math.round(size / 6e4) + 'm'
+             : size < 864e5 ? Math.round(size / 36e5) + 'h'
+             : Math.round(size / 864e5) + 'd';
+  return delta > 0 ? 'in ' + text : text + ' ago';
+}
+
+// An agency with three newsrooms where one is solved is not solved, and showing
+// only the winning method would say that it was.
+function source(r) {
+  if (!r.discovery_method) return '<span class="muted">not solved</span>';
+  if (r.targets_cached < r.targets) {
+    return esc(r.discovery_method)
+      + ' <span class="muted">(' + r.targets_cached + '/' + r.targets + ')</span>';
+  }
+  return esc(r.discovery_method);
+}
+
+// tier 1 is what someone checking on a publisher needs; tier 2 is what someone
+// debugging the cascade needs. `sort` is the column the header orders by, which
+// is not always the one displayed - "Last pulled" reads as a phrase and sorts
+// as a timestamp.
+const COLS = [
+  { key: 'a_id',            label: 'a_id',       tier: 1, cls: 'n',
+    cell: r => r.a_id },
+  { key: 'domain',          label: 'Site',       tier: 1,
+    cell: r => '<div class="domain">' + esc(r.domain) + '</div>'
+             + '<div class="url">' + esc(r.newsroom_url) + '</div>' },
+  { key: 'health',          label: 'Health',     tier: 1,
+    cell: r => { const c = COLOUR[r.severity] || 'inherit';
+                 return '<span class="health" style="color:' + c + '">'
+                      + '<span class="dot" style="background:' + c + '"></span>'
+                      + esc(r.health) + '</span>'; } },
+  { key: 'articles_recent', label: 'Last ' + RECENT + 'd', tier: 1, cls: 'n',
+    cell: r => r.articles_recent },
+  { key: 'last_stored_at',  label: 'Last pulled', tier: 1, cls: 'when',
+    cell: r => esc(ago(r.last_stored_at)) },
+  // Kept in the simple view on purpose: it is the one column written for
+  // someone who does not know what the others mean.
+  { key: 'reason',          label: 'Why',        tier: 1, cls: 'why',
+    cell: r => esc(r.reason) },
+
+  { key: 'discovery_method', label: 'Source',    tier: 2, cell: source },
+  { key: 'articles',        label: 'Articles',   tier: 2, cls: 'n',
+    cell: r => r.articles },
+  { key: 'tns_pending',     label: 'Not loaded', tier: 2, cls: 'n',
+    cell: r => r.tns_pending || 0 },
+  { key: 'consec_failures', label: 'Fails',      tier: 2, cls: 'n',
+    cell: r => r.consec_failures || 0 },
+  { key: 'targets',         label: 'Pages',      tier: 2, cls: 'n',
+    cell: r => r.targets },
+  { key: 'next_due_at',     label: 'Next due',   tier: 2, cls: 'when',
+    cell: r => esc(ago(r.next_due_at)) },
+];
+
+const rowsEl = document.getElementById('rows');
+const noneEl = document.getElementById('none');
+const headEl = document.getElementById('head');
+const chipsEl = document.getElementById('chips');
+const qEl = document.getElementById('q');
+let health = null, uncached = false, sortKey = null, sortAsc = true;
+let detailed = false, opened = null;
+
+// Per-viewer, and only a convenience - the page must render correctly when it
+// comes back empty. A file:// page can throw on access rather than return null.
+try { detailed = localStorage.getItem('scrapev3.detailed') === '1'; } catch (e) {}
+function remember() {
+  try { localStorage.setItem('scrapev3.detailed', detailed ? '1' : '0'); } catch (e) {}
+}
+
+// Counts come from the full set, so a chip still says how many exist while a
+// different filter is active.
+const counts = {}, bands = {};
+let notSolved = 0;
+for (const r of ALL) {
+  counts[r.health] = (counts[r.health] || 0) + 1;
+  bands[r.health] = r.severity;
+  if (r.targets_cached < r.targets) notSolved++;
+}
+
+function shown() {
+  return COLS.filter(c => detailed || c.tier === 1);
+}
+
+function chip(label, n, colour, active, onclick) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'chip';
+  b.innerHTML = esc(label) + ' <span class="n">' + n + '</span>';
+  if (colour) b.style.color = colour;
+  b.setAttribute('aria-pressed', String(active));
+  b.onclick = onclick;
+  chipsEl.appendChild(b);
+}
+
+function header() {
+  const parts = [ALL.length + ' agencies'];
+  Object.entries(counts).sort((a, b) => b[1] - a[1])
+    .forEach(([h, n]) => parts.push(n + ' ' + h));
+  // Both dates, because they answer different questions: one says how fresh
+  // this page is, the other how fresh the crawler's own numbers are. A batch
+  // job that stopped running only moves the first.
+  if (SUMMARY.updated_at) parts.push('crawler last wrote ' + SUMMARY.updated_at);
+  if (GRID.generated_at) parts.push('read ' + GRID.generated_at + ' UTC');
+  document.getElementById('meta').textContent = parts.join(' · ');
+
+  const note = document.getElementById('note-text').textContent.trim();
+  if (note) {
+    const div = document.createElement('div');
+    div.className = 'note';
+    div.textContent = note;
+    document.getElementById('note').appendChild(div);
+  }
+}
+
+function renderHead() {
+  headEl.innerHTML = shown().map(c =>
+    '<th data-sort="' + c.key + '"' + (c.cls === 'n' ? ' class="n"' : '') + '>'
+    + esc(c.label) + '</th>').join('');
+  headEl.querySelectorAll('th[data-sort]').forEach(th => {
+    if (th.dataset.sort === sortKey) {
+      th.setAttribute('aria-sort', sortAsc ? 'ascending' : 'descending');
+    }
+    th.onclick = () => {
+      const key = th.dataset.sort;
+      sortAsc = (sortKey === key) ? !sortAsc : true;
+      sortKey = key;
+      render();
+    };
+  });
+}
+
+// Every field the payload carries, for one agency. Nothing is selected or
+// renamed here: a field added upstream shows up without this page changing,
+// which is the point of opening a row rather than adding a column.
+function detailRow(r, span) {
+  const fields = Object.keys(r).map(k => {
+    const v = r[k];
+    const text = (v === null || v === undefined) ? '—' : String(v);
+    return '<div><dt>' + esc(k) + '</dt><dd>' + esc(text) + '</dd></div>';
+  }).join('');
+  return '<tr class="detail"><td colspan="' + span + '">'
+       + '<dl class="fields">' + fields + '</dl></td></tr>';
+}
+
+function render() {
+  chipsEl.innerHTML = '';
+  chip('all', ALL.length, '', !health && !uncached,
+       () => { health = null; uncached = false; render(); });
+  Object.entries(counts).sort((a, b) => b[1] - a[1]).forEach(([h, n]) =>
+    chip(h, n, COLOUR[bands[h]] || '', health === h,
+         () => { health = (health === h) ? null : h; render(); }));
+  // Not a health word: an agency can be perfectly healthy and still own a
+  // newsroom the cascade has never solved, so no severity points at this.
+  chip('not solved', notSolved, '', uncached,
+       () => { uncached = !uncached; render(); });
+
+  const spacer = document.createElement('span');
+  spacer.className = 'spacer';
+  chipsEl.appendChild(spacer);
+
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'depth';
+  toggle.textContent = detailed ? 'Fewer columns' : 'More columns';
+  toggle.setAttribute('aria-pressed', String(detailed));
+  toggle.onclick = () => {
+    detailed = !detailed;
+    // A sort on a column that is about to disappear would leave the table in an
+    // order with nothing on screen to explain it.
+    if (!detailed && sortKey && !shown().some(c => c.key === sortKey)) sortKey = null;
+    remember();
+    render();
+  };
+  chipsEl.appendChild(toggle);
+
+  const q = qEl.value.trim().toLowerCase();
+  let rows = ALL.filter(r =>
+    (!health || r.health === health) &&
+    (!uncached || r.targets_cached < r.targets) &&
+    (!q || String(r.a_id) === q
+        || (r.domain || '').toLowerCase().includes(q)
+        || (r.reason || '').toLowerCase().includes(q)));
+
+  if (sortKey) {
+    // Nulls last in both directions, and a_id breaking every tie - the same
+    // order `clients/status.php` asks MySQL for, so a page reading the database
+    // and a page reading a fixture agree.
+    const present = rows.filter(r => r[sortKey] !== null && r[sortKey] !== undefined);
+    const absent = rows.filter(r => r[sortKey] === null || r[sortKey] === undefined);
+    const key = r => {
+      const v = r[sortKey];
+      return typeof v === 'string' ? v.toLowerCase() : v;
+    };
+    present.sort((a, b) => {
+      const x = key(a), y = key(b);
+      if (x === y) return a.a_id - b.a_id;
+      return (x < y ? -1 : 1) * (sortAsc ? 1 : -1);
+    });
+    absent.sort((a, b) => a.a_id - b.a_id);
+    rows = present.concat(absent);
+  }
+
+  renderHead();
+  const cols = shown();
+  rowsEl.innerHTML = rows.map(r =>
+    '<tr class="row" data-id="' + r.a_id + '">'
+    + cols.map(c => '<td' + (c.cls ? ' class="' + c.cls + '"' : '') + '>'
+                  + c.cell(r) + '</td>').join('')
+    + '</tr>'
+    + (opened === r.a_id ? detailRow(r, cols.length) : '')).join('');
+
+  rowsEl.querySelectorAll('tr.row').forEach(tr => {
+    tr.onclick = () => {
+      const id = Number(tr.dataset.id);
+      opened = (opened === id) ? null : id;
+      render();
+    };
+  });
+
+  noneEl.hidden = rows.length > 0;
+  document.getElementById('footer').innerHTML = detailed ? FOOTER_FULL : FOOTER_SIMPLE;
+}
+
+const FOOTER_SIMPLE =
+  '<p><strong>Health</strong> is the crawler\'s own verdict, and <strong>Why</strong>'
+  + ' explains it in a sentence. <strong>Last pulled</strong> is when we last took'
+  + ' a document from the site. <em>quiet</em> is not a fault - it means the site'
+  + ' works and the publisher has not posted.</p>'
+  + '<p class="muted">Click any row for everything the crawler knows about it,'
+  + ' or “More columns” for the rest of the detail.</p>';
+
+const FOOTER_FULL =
+  '<p>Health is decided by the crawler, not by this page. <code>severity</code>'
+  + ' is a closed vocabulary (ok / warn / error) and is what a real grid should'
+  + ' colour on; <code>health</code> is a label to display. To change what counts'
+  + ' as healthy, edit <code>src/scrapev3/status.py</code>.</p>'
+  + '<p><strong>Last pulled</strong> is <code>last_stored_at</code>, when we last'
+  + ' put a document in the index — not <code>last_article_at</code>, which is the'
+  + ' publisher\'s own date on the newest thing we hold. <strong>Not loaded</strong>'
+  + ' is <code>tns_pending</code>: stored here, never landed in'
+  + ' <code>press_release</code>. <strong>Source</strong> reads “not solved” when'
+  + ' discovery has never found a way into a newsroom, and shows a fraction when it'
+  + ' has solved only some of the agency’s pages.</p>';
+
+qEl.oninput = () => { opened = null; render(); };
+header();
+render();
+</script>
+</html>

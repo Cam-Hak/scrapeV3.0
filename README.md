@@ -593,6 +593,74 @@ First run against a live crawl: **49 rows**, 17 agencies, 49 distinct
 filenames, no non-ASCII bytes, every `a_id` joining to `agencies`, 39 status
 `D` and 7 status `W`.
 
+## Talking to the website
+
+Two codebases, one MySQL, four tables and no API. `clients/README.md` is the
+contract; this is why it is shaped that way.
+
+| Direction | Table | Who writes | Who reads |
+|---|---|---|---|
+| Remove an agency | `scrapev3.removed_agency` | the website | the crawler |
+| Request a site | `scrapev3.requested_site` | the website | the crawler |
+| Crawl health and inventory | `scrapev3.agency_status` | the crawler | the website |
+
+**Both lists are reconciled, never drained.** The obvious shape for either is a
+queue the crawler consumes, and it breaks the moment there is a second crawler:
+the first to drain the row acts on it and the second never does, so an agency is
+removed on one machine and not the other. Silently. So each table is the current
+*set*, and every pass makes local state match it — idempotent, self-healing
+after downtime, correct with one crawler or five.
+
+**A removal outranks a request.** The website owns both write tables, so it can
+ask for two incompatible things. Without a rule the request wins by accident and
+keeps winning: purge the agency, re-seed it from the request list next pass,
+purge it again, forever — and a publisher who asked to be taken out stays in the
+crawl with no trace but a removal that never finishes. Requests whose `a_id` is
+on the removal list are refused and *counted*.
+
+**The crawler decides health; the website only draws it.** A row carries a
+`health` word, a `severity` to colour on, and a `reason` in plain English.
+`severity` is a closed three-value vocabulary and unknown `health` words resolve
+to `warn`, so a fault added here shows as a problem on a site nobody has
+redeployed. Two distinctions carry the weight: `quiet` (we crawl it fine, the
+publisher has not posted) is not a fault, and `empty` (we crawl it fine and
+store nothing) is a different fault from `stale` (we stopped reaching it) —
+`empty` was 92 of the first 324 agencies crawled.
+
+`agency_status` carries the inventory in the same row rather than a second
+table: whether discovery is solved and by what, when we last actually pulled a
+document, when the schedule comes back. A parallel table on the same key,
+written by the same pass from the same stores, would buy a join and a way for
+the pair to be half-published. Columns are appended and both clients select by
+name, so widening it does not break a deployed site — but `_DDL` is `CREATE
+TABLE IF NOT EXISTS`, so anything added after the first deployment must go in
+`_MIGRATIONS` too, and a test pins that the two lists agree.
+
+### Two silent failures found building it
+
+| Bug | Impact | Fix |
+|---|---|---|
+| **Local sorting disagreed with MySQL's** | `agency_status` is `utf8mb4_0900_ai_ci`; Python and PHP compare bytes. A site reading the JSON fixture and one reading the database returned different orders for the same query — intermittently, because it only shows when two rows on the same host differ by a capital. 250 of the live newsroom URLs carry one (`navy.mil/Press-Office`, `centcom.mil/MEDIA`) | Case folded in both local comparators. The first sweep reported zero mismatches across all 58 column/direction pairs and was wrong: the check for mixed-case data used `col <> LOWER(col)`, which is always false *under* a case-insensitive collation. Accents are still not folded — `ai` also equates `e` and `é` |
+| **Sorting had no tiebreak** | `ORDER BY health` leaves ~2,000 rows tied and MySQL may return them in any order, so paging repeated and skipped rows | `a_id` breaks every tie, always ascending, in both directions. Nulls sort last both ways too: "never pulled a document" is the absence of a date, not the smallest one |
+
+Verified against the live grid: 58 column/direction pairs, 24 filter/sort
+combinations and 4 paging tilings, all agreeing between MySQL and the local
+comparator.
+
+### Looking at it
+
+```bash
+scrapev3 status --html            # standalone page, no server, data embedded
+php -S localhost:8000 -t clients  # then /example.php - the drop-in snippet
+```
+
+`src/scrapev3/status_view.html` is the page, and both the crawler and
+`clients/status_demo.php` fill it from the same payload. Two renderers kept in
+step by hand drift exactly like two definitions of "healthy" would, and the
+first pair here disagreed about which columns existed within a day. It opens on
+six columns, has a toggle for the cascade detail, and shows every field in the
+payload when a row is clicked.
+
 ## Politeness
 
 Not best-effort — enforced by construction and covered by tests:
@@ -627,6 +695,7 @@ that records request arrival and completion timestamps.
 - [x] Phase 2 — domain-lease frontier (SQLite now, MySQL ready)
 - [x] Phase 3 — discovery cascade + extraction cascade + crawl loop + JSONL sink
 - [x] Phase 3.5 — the `tns.press_release` MySQL sink, pulled ahead of Phase 4
+- [x] Phase 3.6 — the website contract: removal list, request list, health grid
 - [ ] Phase 4 — quality baselines and drift detection
 - [ ] Phase 5 — local LLM wrapper induction (Ollama) + review queue
 - [ ] Phase 6 — post-processing (ftfy, keyword routing, MinHash dedup, per-domain
