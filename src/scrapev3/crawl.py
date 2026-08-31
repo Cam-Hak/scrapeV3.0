@@ -24,7 +24,7 @@ from .discover.sources import ArticleRef, discover
 from .extract import extract_article
 from .extract.models import Article
 from .extract.models import Path as ArticlePath
-from .fetch import PoliteFetcher
+from .fetch import PoliteFetcher, failure_kind
 from .frontier import Frontier, open_frontier
 from .urls import canonical_url, classify_url, is_non_news_path, registrable_domain
 from .settings import Settings
@@ -101,8 +101,48 @@ class CrawlStats:
     # from `errors` so that list stays worth reading.
     notes: list[str] = field(default_factory=list)
 
+    # One example of the message each kind was derived from. `by_failure` is
+    # keyed on the kind now, which is what stops it fragmenting - but "dns x20"
+    # with no example is a summary nobody can act on, so one is kept.
+    failure_sample: dict[str, str] = field(default_factory=dict)
+    # Faults as (kind, domain) -> [occurrences, a_id, url, detail], ready for
+    # `FaultStore.record`. Accumulated here rather than written per occurrence
+    # so a crawl never waits on a disk write inside the per-article loop, and so
+    # a run that dies mid-pass still persists whatever the `finally` reaches.
+    faults: dict[tuple[str, str], list] = field(default_factory=dict)
+
     def bump(self, bucket: dict[str, int], key: str) -> None:
         bucket[key] = bucket.get(key, 0) + 1
+
+    def record_fault(self, kind: str, domain: str, *, a_id: int | None = None,
+                     url: str | None = None, detail: str | None = None) -> None:
+        """Note one occurrence. First writer supplies the sample."""
+        entry = self.faults.get((kind, domain))
+        if entry is None:
+            self.faults[(kind, domain)] = [1, a_id, url, detail]
+        else:
+            entry[0] += 1
+
+    def to_dict(self) -> dict:
+        """The counters, JSON-safe, for `fault_run.stats_json`.
+
+        The sets in `failure_domains`/`unusable_domains` become sorted lists;
+        everything else is already a number or a string. This is the
+        serialisation `CrawlStats` never had - the reason a run's diagnosis
+        died with the process.
+        """
+        from dataclasses import asdict
+
+        out = {}
+        for key, value in asdict(self).items():
+            if key == "faults":
+                continue                      # persisted as rows, not as JSON
+            if isinstance(value, dict) and value and all(
+                    isinstance(v, set) for v in value.values()):
+                out[key] = {k: sorted(v) for k, v in value.items()}
+            else:
+                out[key] = value
+        return out
 
 
 async def crawl_target(
@@ -218,7 +258,7 @@ async def crawl_target(
             continue
         stale_streak = 0
 
-        article = await _extract_ref(fetcher, ref, stats, domain)
+        article = await _extract_ref(fetcher, ref, stats, domain, a_id)
         if article is None:
             continue        # _extract_ref has already classified and counted it
 
@@ -327,7 +367,8 @@ def _prefer_section(refs, newsroom_url: str):
 
 
 async def _extract_ref(fetcher: PoliteFetcher, ref: ArticleRef,
-                       stats: CrawlStats, domain: str = "") -> Article | None:
+                       stats: CrawlStats, domain: str = "",
+                       a_id: int | None = None) -> Article | None:
     """Build an Article from a reference, fetching only when necessary."""
     fetched_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -368,17 +409,30 @@ async def _extract_ref(fetcher: PoliteFetcher, ref: ArticleRef,
     resp = await fetcher.get(ref.url)
     stats.fetched += 1
     if not resp.ok:
-        # A wall answers 200, so the status alone would report "HTTP 200" for
-        # a page we never actually got.
-        reason = resp.error or (f"bot wall: {resp.wall}" if resp.wall
-                                else f"HTTP {resp.status}")
-        if reason == "robots-disallow":
+        # `failure_kind` already handles the case the old inline expression was
+        # written for - a wall answers 200, so the status alone would report
+        # "HTTP 200" for a page we never actually got - and it handles the four
+        # unrelated things `status = 0` means, which the inline version did not.
+        #
+        # Keyed on the kind rather than on `resp.error`, which is
+        # f"{ClassName}: {message}" with the URL inside it: two timeouts on
+        # different URLs used to be two rows, so the histogram fragmented into
+        # exactly the per-article noise it exists to summarise.
+        kind = failure_kind(resp)
+        if kind == "robots":
             stats.robots_disallowed += 1
             return None
+        detail = resp.error or (f"bot wall: {resp.wall}" if resp.wall
+                                else f"HTTP {resp.status}")
         stats.failed += 1
-        stats.bump(stats.by_failure, reason)
+        stats.bump(stats.by_failure, kind)
+        # The message the kind was derived from, kept once per kind so the
+        # detail survives the summarising.
+        stats.failure_sample.setdefault(kind, detail)
         if domain:
-            stats.failure_domains.setdefault(reason, set()).add(domain)
+            stats.failure_domains.setdefault(kind, set()).add(domain)
+            stats.record_fault(kind, domain, a_id=a_id, url=ref.url,
+                               detail=detail)
         return None
 
     article = extract_article(
@@ -451,6 +505,37 @@ def _apply_requests(settings: Settings, frontier: Frontier,
     return report.seeded, len(report.refused)
 
 
+def _persist_faults(settings: Settings, stats: CrawlStats, run_id: str,
+                    scope: str | None) -> int:
+    """Write this pass's faults to the store. Never raises.
+
+    Swallowed for the same reason `_publish_status` is: a diagnostic failing to
+    record is not a reason to lose the crawl that produced it. The failure goes
+    into `stats.errors`, which is printed.
+    """
+    from .faults import FaultStore
+
+    try:
+        store = FaultStore(settings.data_dir)
+    except Exception as exc:                                # noqa: BLE001
+        stats.errors.append(f"faults not recorded: {type(exc).__name__}: {exc}")
+        return 0
+    try:
+        store.start_run(run_id, command="crawl", scope=scope)
+        for (kind, domain), (n, a_id, url, detail) in stats.faults.items():
+            store.record(run_id, kind, domain, n=n, a_id=a_id, url=url,
+                         detail=detail)
+        store.finish_run(run_id, domains=stats.domains, targets=stats.targets,
+                         stats=stats.to_dict())
+        store.prune()
+    except Exception as exc:                                # noqa: BLE001
+        stats.errors.append(f"faults not recorded: {type(exc).__name__}: {exc}")
+        return 0
+    finally:
+        store.close()
+    return len(stats.faults)
+
+
 def _publish_status(settings: Settings, frontier: Frontier, sink: Sink,
                     stats: CrawlStats) -> int:
     """Publish per-agency health for the website. Never raises.
@@ -506,6 +591,15 @@ async def crawl_once(
     frontier = frontier or open_frontier()
     sink = sink or Sink(settings.data_dir)
     stats = CrawlStats()
+
+    # Stamped before the work, so the run is identifiable even if the pass dies
+    # and only the `finally` gets to write. Same shape as `data/audits/`, so the
+    # two sort together.
+    from .faults import new_run_id
+
+    run_id = new_run_id()
+    scope = (", ".join(only_domains) if only_domains
+             else f"a_id {only_a_id}" if only_a_id else None)
 
     try:
         frontier.release_expired_leases()
@@ -643,6 +737,8 @@ async def crawl_once(
         # leased nothing still has staleness to report.
         if settings.status_enabled:
             stats.status_published = _publish_status(settings, frontier, sink, stats)
+        if settings.faults_enabled:
+            _persist_faults(settings, stats, run_id, scope)
         if owns_sink:
             sink.close()
         if owns_frontier:

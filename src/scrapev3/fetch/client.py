@@ -201,6 +201,106 @@ def failure_kind(resp: "Response") -> str:
     return "error"
 
 
+# Every word `failure_kind` can return. The set was closed by test and by
+# docstring but never by constant, which is one import away from drifting - a
+# word added to the function and nowhere else would be counted, ranked and
+# rendered as though it had always been there.
+#
+# Ordered worst-understood first, and the two non-failures last: `ok` and
+# `not_modified` are reachable outputs of the function and are deliberately
+# absent from `_SEVERITY` and `_OWNER` below, because they never reach a
+# failure path.
+FAILURE_KINDS = ("dns", "circuit", "error", "tls", "http2", "http_4xx",
+                 "connect", "timeout", "http_5xx", "wall", "robots",
+                 "not_modified", "ok")
+
+# The two that are not faults. Split out rather than merely omitted from the
+# maps below, because an omission would fall through to the unknown default and
+# score `ok` as broken - and the unknown default has to stay loud.
+NOT_FAILURES = ("ok", "not_modified")
+
+# The same three words `HostVerdict.access` documents, plus the one the crawl
+# writes itself (`js_rendered`, set from the js-shell majority heuristic rather
+# than by the fetcher). Named here so `status._worse_access` can be checked
+# against it instead of carrying the only enumeration in an ordering dict.
+ACCESS_VERDICTS = ("challenge", "refused", "unresolved", "js_rendered")
+
+# How bad it is, on `audit.Finding`'s scale rather than a fourth one:
+# 3 broken, 2 suspicious, 1 worth a look.
+#
+# `robots` and `wall` are 1 because nothing is broken - the rule worked, or the
+# publisher said no. They are still recorded, because "27 targets refused" is
+# worth knowing; they are simply not defects.
+_SEVERITY = {
+    "dns": 3, "circuit": 3, "error": 3,
+    "tls": 2, "http2": 2, "http_4xx": 2, "connect": 2, "timeout": 2,
+    "http_5xx": 2,
+    "wall": 1, "robots": 1,
+}
+
+# Whose problem this is. This is the "whose problem" column of the re-audit
+# table in README, in code, so it can be ranked on rather than read.
+#
+#   us      our defect or our data. Fixable, and the count should trend to
+#           zero. This is the only bucket that is a to-do list.
+#   site    the publisher's server or certificate. A better crawler might cope;
+#           it will never be zero.
+#   policy  they declined an identified crawler on purpose. Counted and
+#           attributed in full, and never ranked - see `faults._OWNER_WEIGHT`.
+_OWNER = {
+    "robots": "policy",   # robots.txt disallowed it and we obeyed. 27 of 149
+    "wall": "policy",     # a genuine bot wall. 8 left after the identity fix
+    "dns": "us",          # our resolver: 20 .mil targets that 1.1.1.1 answered
+    "circuit": "us",      # our own breaker, opened on our own thresholds
+    "http2": "us",        # our impersonation profile negotiates h2. 7 targets
+    "http_4xx": "us",     # dead newsroom_url values - an intake problem
+    "error": "us",        # an exception class we have not mapped yet
+    "tls": "site",        # expired or untrusted chain. 8 targets
+    "connect": "site",
+    "timeout": "site",
+    "http_5xx": "site",
+}
+
+# The access verdicts, judged the same way. Consistent with the severities
+# `status._SEVERITY` already gives the health words they produce: `refused` is
+# `warn` (their call), `unresolved` is `error` (ours).
+_ACCESS_OWNER = {
+    "refused": "policy",
+    "challenge": "policy",
+    "unresolved": "us",
+    "js_rendered": "site",
+}
+
+
+def severity_of(kind: str) -> int:
+    """How bad a failure kind is. Unknown kinds are treated as broken.
+
+    Loud rather than quiet, for the reason `status.severity_of` resolves an
+    unknown health word to `warn`: a kind that reaches this function without
+    being classified is a gap in our own map, and a gap must not read as fine.
+
+    `ok` and `not_modified` score 0 instead. They are known-good, not unknown,
+    so the safe direction for them is the bottom of the list rather than the
+    top - a successful fetch ranked as broken would be worse than not ranking
+    it at all.
+    """
+    if kind in NOT_FAILURES:
+        return 0
+    return _SEVERITY.get(kind, 3)
+
+
+def owner_of(kind: str) -> str:
+    """Whose problem a failure kind is: `us`, `site` or `policy`.
+
+    Unknown kinds are `us` for the same reason - an unmapped word is our
+    omission, so it belongs on our list until someone says otherwise. Accepts
+    access verdicts too, so a caller holding either vocabulary can ask.
+    """
+    if kind in _ACCESS_OWNER:
+        return _ACCESS_OWNER[kind]
+    return _OWNER.get(kind, "us")
+
+
 # Which refusals a browser could plausibly get past, and which it could not.
 # The distinction is load-bearing rather than cosmetic: of 41 walls in the
 # first corpus run, 30 were "access denied" - a flat refusal that renders the

@@ -43,6 +43,8 @@ scrapev3 remove --a-id 22385             # honour a removal request, permanently
 scrapev3 remove --list | remove --apply  # the shared list; reconcile it now
 scrapev3 request --a-id 22385 --url https://x.org/news   # honour an add request
 scrapev3 request --list | request --apply       # the shared list; reconcile it now
+scrapev3 faults                          # what went wrong, ranked; --owner us
+scrapev3 faults --kind dns --runs 7      # one kind, across the last 7 runs
 scrapev3 status --health empty           # per-agency health; --publish for the website
 scrapev3 status --uncached --limit 40    # newsrooms discovery has never solved
 scrapev3 status --json data/status.json  # refresh the demo page's fixture
@@ -80,6 +82,7 @@ nothing on a daily re-crawl.
 | [audit.py](src/scrapev3/audit.py) | Scores discovery output for plausibility without fetching articles |
 | [removal.py](src/scrapev3/removal.py) | Purges one `a_id` from every store; owns the shared removal list |
 | [status.py](src/scrapev3/status.py) | Per-agency health *and* inventory for the website's grid; `classify` is pure |
+| [faults.py](src/scrapev3/faults.py) | Ranks `failure_kind` words by severity x breadth x owner; owns `data/faults.sqlite` |
 | [site_requests.py](src/scrapev3/site_requests.py) | Seeds one `a_id`+URL from the shared request list; mirror of `removal.py` |
 | [tracing.py](src/scrapev3/tracing.py) | `--debug` decision logging, printed through the progress bar's Console |
 
@@ -149,6 +152,22 @@ feed/wp-json bodies are `FEED`/`CMS_API`, not `TRAFILATURA`.
   under two agencies, and VARCHAR(768) utf8mb4 is already InnoDB's whole 3072-byte
   key limit. There is deliberately no `domain` column - the crawler derives it,
   since that value is its pacing and shard key. Off unless `SCRAPEV3_REQUESTS=on`.
+- **`FAILURE_KINDS` and `ACCESS_VERDICTS` are the vocabularies; `severity` and
+  `owner` are derived from them and never stored.** So a rule change re-ranks
+  every run already recorded - `audit --rescore`'s property - and a stored row
+  can never disagree with the classifier that would judge it today. The maps
+  live in `fetch/client.py` beside the words; the ranking lives in `faults.py`.
+  Unknown kinds fail loud (severity 3, owner `us`) because an unmapped word is
+  our omission; `ok`/`not_modified` score 0 because they are known-good rather
+  than unknown; an unranked *band* fails quiet, because a list whose top item
+  is noise stops being read. `by_failure` is keyed on the kind, never on
+  `resp.error` - that string carries the URL, so it used to fragment one cause
+  into one row per article.
+- **`policy` is weighted zero, and that is the whole point of the owner axis.**
+  Robots refusals and bot walls are recorded with every domain attributed and
+  never rank. Counting them as defects puts a rule we are correctly obeying at
+  the top of the work queue forever; omitting them loses the attribution that
+  made "27 targets refused" knowable at all.
 - **The website's sort has to be a total order, and has to match the fixture.**
   `clients/status.{php,py}` build every `ORDER BY` through one whitelist:
   nulls last in both directions (MySQL puts them first ascending), `a_id` as an

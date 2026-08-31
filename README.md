@@ -861,6 +861,54 @@ request of a pair, so a rendered page is strictly more paced than a fetched
 one. robots.txt is checked above it in `_get_once` and is not reachable by any
 other route — `tests/test_browser_tier.py` pins that one specifically.
 
+### Ranking what to fix first
+
+The table above has a *whose problem* column, and the crawl had no way to act on
+it. `by_failure` sorted on occurrences, so the loudest single site came first —
+and it also keyed on `resp.error`, which is `f"{ClassName}: {message}"` with the
+URL inside the message, so two timeouts on different URLs were two rows. The
+histogram fragmented into exactly the per-article noise it exists to summarise.
+
+`severity` and `owner` are derived from the `failure_kind` word, never stored —
+so a rule change re-ranks every run already recorded, the same property
+`audit --rescore` has:
+
+```
+score = severity × distinct_domains × owner_weight
+owner_weight = { us: 3, site: 1, policy: 0 }
+```
+
+**Breadth, not frequency.** One site 404ing forty URLs and twenty sites failing
+once each are the same total and completely different problems; the second is a
+defect of ours that twenty publishers are demonstrating, and fixing it once pays
+twenty times. Occurrences stay a displayed column and the tiebreak.
+
+**`policy` is weighted zero**, which is the sentence above as arithmetic. The 27
+robots refusals and 8 walls are recorded with every domain attributed, and never
+rank — a list that opens with a rule we are correctly obeying is a list nobody
+reads to the bottom.
+
+| Kind | Whose | Why |
+|---|---|---|
+| `dns`, `circuit`, `error` | **us** | our resolver, our breaker, an exception class we have not mapped |
+| `http2`, `http_4xx` | **us** | our impersonation profile; our own stale `newsroom_url` values |
+| `tls`, `connect`, `timeout`, `http_5xx` | site | their certificate, their server |
+| `robots`, `wall` | policy | they declined an identified crawler |
+
+Faults land in `data/faults.sqlite`, aggregated per `(run, kind, domain)` with
+one sample URL and message each — roughly 600 rows a run rather than the
+thousands of occurrences behind them, since the questions are "how many" and
+"which sites". Thirty runs are kept, which is a month at daily cadence and the
+window in which "is this new?" is still answerable. `a_id` is stored but is not
+part of the key: `house.gov` carries 417 agencies and a fetch fault belongs to
+the domain, which is the pacing and blame unit.
+
+```bash
+scrapev3 faults              # ranked; robots and walls hidden
+scrapev3 faults --owner us   # the to-do list
+scrapev3 faults --kind dns   # every domain that raised it, with samples
+```
+
 ## Politeness
 
 Not best-effort — enforced by construction and covered by tests:

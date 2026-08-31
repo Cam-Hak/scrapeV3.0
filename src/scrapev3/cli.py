@@ -14,6 +14,7 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
+from .fetch import owner_of as fetch_owner_of
 from .settings import Settings
 from .survey import read_sites, run_survey, summarize
 
@@ -516,6 +517,10 @@ def _publish_status(settings: Settings, rows, *, prune: bool) -> int:
 
 _SEVERITY_STYLE = {"ok": "green", "warn": "yellow", "error": "red"}
 
+# `policy` is dim on purpose: it is counted, attributed, and not a to-do.
+_OWNER_STYLE = {"us": "red", "site": "yellow", "policy": "dim"}
+_BAND_STYLE = {"urgent": "red", "notable": "yellow", "minor": "dim"}
+
 
 def _print_status(rows, summary: dict, *, limit: int) -> None:
     from .status import RECENT_DAYS, severity_of
@@ -579,6 +584,96 @@ def _ago(when) -> str:
     else:
         size = f"{int(seconds // 86400)}d"
     return f"in {size}" if delta.total_seconds() > 0 else f"{size} ago"
+
+
+def _cmd_faults(args: argparse.Namespace) -> int:
+    """What went wrong, ranked by what is worth fixing first."""
+    from .faults import FaultStore, summarise, tally, to_json, worst_domains
+
+    settings = Settings.load()
+    store = FaultStore(settings.data_dir)
+    try:
+        ids = store.run_ids(limit=max(1, args.runs))
+        if not ids:
+            console.print("[dim]No runs recorded yet.[/dim] "
+                          "[dim]Faults are written by `scrapev3 crawl`.[/dim]")
+            return 0
+        rows = store.rows(kind=args.kind, domain=args.domain,
+                          owner=args.owner, runs=max(1, args.runs))
+        run = store.run(ids[0]) or {}
+    finally:
+        store.close()
+
+    if args.json is not None:
+        payload = to_json(rows, run)
+        if args.json == "-":
+            console.print_json(payload)
+        else:
+            Path(args.json).write_text(payload, encoding="utf-8")
+            console.print(f"Wrote {len(rows)} fault rows to {args.json}")
+        return 0
+
+    # `policy` is hidden by default and counted in the header regardless. A
+    # robots refusal is not a defect, and a list that opens with 27 of them is
+    # a list nobody reads to the bottom.
+    shown = rows if (args.all or args.owner) else [
+        r for r in rows if r.owner != "policy"]
+
+    summary = summarise(rows)
+    scope = f" ({run.get('scope')})" if run.get("scope") else ""
+    console.print(
+        f"[bold]{run.get('run_id', ids[0])}[/bold]{scope} - "
+        f"{run.get('domains', 0)} domains, {run.get('targets', 0)} targets"
+        + (f", last {args.runs} runs" if args.runs > 1 else ""))
+    owner = summary["owner"]
+    console.print(
+        f"[red]us {owner.get('us', 0)}[/red] · "
+        f"[yellow]site {owner.get('site', 0)}[/yellow] · "
+        f"[dim]policy {owner.get('policy', 0)}[/dim]"
+        f"   [dim]{summary['occurrences']} occurrences across "
+        f"{summary['domains']} domains[/dim]")
+
+    if not shown:
+        console.print("\n[green]Nothing that is ours to fix.[/green]"
+                      if rows else "\n[green]No faults recorded.[/green]")
+        return 0
+
+    t = Table(title="Needs attention", header_style="bold")
+    for col in ("Kind", "Whose", "Sev"):
+        t.add_column(col)
+    for col in ("Domains", "Articles", "Score"):
+        t.add_column(col, justify="right")
+    t.add_column("Band")
+    t.add_column("Example", overflow="fold")
+    for entry in tally(shown)[:args.limit]:
+        style = _BAND_STYLE.get(entry.band, "white")
+        t.add_row(entry.kind,
+                  f"[{_OWNER_STYLE.get(entry.owner, 'white')}]{entry.owner}[/]",
+                  str(entry.severity), str(len(entry.domains)),
+                  str(entry.occurrences), f"{entry.score:.0f}",
+                  f"[{style}]{entry.band}[/{style}]",
+                  entry.domains[0] if entry.domains else "")
+    console.print(t)
+
+    # Only when a domain failed in more than one way. A domain with a single
+    # kind is already fully described by the table above, and twenty of them
+    # tied at the same score is a screen of noise that buries the one site
+    # actually falling apart.
+    worst = [w for w in worst_domains(shown) if len(w[2]) > 1]
+    if worst and not args.domain:
+        w = Table(title="Worst domains", header_style="bold")
+        w.add_column("Domain", overflow="fold")
+        w.add_column("Score", justify="right")
+        w.add_column("Failed how", overflow="fold")
+        for dom, score, kinds in worst:
+            w.add_row(dom, str(score), ", ".join(kinds))
+        console.print(w)
+
+    if not args.all and not args.owner and len(rows) != len(shown):
+        console.print(f"[dim]{len(rows) - len(shown)} row(s) hidden: robots "
+                      f"refusals and bot walls are not ours to fix. "
+                      f"--all shows them.[/dim]")
+    return 0
 
 
 def _removed_agency_ids(settings: Settings) -> set[int]:
@@ -965,15 +1060,30 @@ def _cmd_crawl(args: argparse.Namespace) -> int:
         console.print(m)
 
     if stats.by_failure:
+        from .faults import attention, band
+
         f = Table(title="Why fetches failed", header_style="bold")
-        f.add_column("Reason", overflow="fold")
+        f.add_column("Kind")
+        f.add_column("Whose")
         f.add_column("Articles", justify="right")
-        f.add_column("Domains", overflow="fold")
-        for k, v in sorted(stats.by_failure.items(), key=lambda kv: -kv[1]):
+        f.add_column("Domains", justify="right")
+        f.add_column("Where", overflow="fold")
+        # Ranked, not counted. One site failing forty times and twenty sites
+        # failing once are the same total and completely different problems.
+        ranked = sorted(
+            stats.by_failure.items(),
+            key=lambda kv: (-attention(kv[0], len(stats.failure_domains.get(kv[0], ()))),
+                            -kv[1]))
+        for k, v in ranked:
             doms = sorted(stats.failure_domains.get(k, ()))
             shown = ", ".join(doms[:3]) + (f" +{len(doms) - 3}" if len(doms) > 3 else "")
-            f.add_row(k, str(v), shown)
+            style = _OWNER_STYLE.get(fetch_owner_of(k), "white")
+            f.add_row(k, f"[{style}]{fetch_owner_of(k)}[/{style}]",
+                      str(v), str(len(doms)), shown)
         console.print(f)
+        sample = stats.failure_sample.get(ranked[0][0]) if ranked else None
+        if sample:
+            console.print(f"[dim]  e.g. {ranked[0][0]}: {sample[:100]}[/dim]")
 
     if stats.by_unusable:
         u = Table(title="Why articles were unusable", header_style="bold")
@@ -1005,6 +1115,12 @@ def _cmd_crawl(args: argparse.Namespace) -> int:
         console.print(f"\n[yellow]{len(stats.errors)} error(s), first few:[/yellow]")
         for err in stats.errors[:8]:
             console.print(f"  [dim]{err[:110]}[/dim]")
+
+    # The run's failures outlive it now. This line is the whole point of that:
+    # the tables above are capped at three domains and eight errors, and used to
+    # be the only record there was.
+    if stats.faults and Settings.load().faults_enabled:
+        console.print("[dim]Recorded. Rank them with: scrapev3 faults[/dim]")
 
     # Not errors: the cascade declining a site-wide source because it could not
     # be tied to the target's own section. Printed apart from the error list so
@@ -1784,6 +1900,27 @@ def main(argv: list[str] | None = None) -> int:
                            help="Take a request off the list (needs --a-id). "
                                 "Does NOT un-seed it; use `remove` for that")
     p_request.set_defaults(func=_cmd_request)
+
+    p_faults = sub.add_parser(
+        "faults",
+        help="What went wrong, ranked by what is worth fixing first.")
+    p_faults.add_argument("--owner", choices=["us", "site", "policy"],
+                          default=None,
+                          help="Only faults of this kind: 'us' is the to-do list")
+    p_faults.add_argument("--kind", default=None,
+                          help="Only this failure kind (dns, tls, http_4xx, ...)")
+    p_faults.add_argument("--domain", default=None, help="Only this domain")
+    p_faults.add_argument("--all", action="store_true",
+                          help="Include robots refusals and bot walls, which "
+                               "are hidden by default")
+    p_faults.add_argument("--runs", type=int, default=1,
+                          help="Aggregate the last N runs (default 1)")
+    p_faults.add_argument("--limit", type=int, default=15,
+                          help="Rows to print (default 15)")
+    p_faults.add_argument("--json", nargs="?", const="-", default=None,
+                          metavar="PATH",
+                          help="Emit the same payload as JSON; '-' prints it")
+    p_faults.set_defaults(func=_cmd_faults)
 
     p_status = sub.add_parser(
         "status",

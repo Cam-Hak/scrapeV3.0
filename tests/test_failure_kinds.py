@@ -20,7 +20,7 @@ it gets the same treatment as any other: a named regression test per bug.
 from __future__ import annotations
 
 from scrapev3.audit import TargetAudit, judge
-from scrapev3.fetch.client import Response, failure_kind
+from scrapev3.fetch.client import FAILURE_KINDS, Response, failure_kind
 
 
 def _resp(**kw) -> Response:
@@ -69,15 +69,16 @@ class TestTheVocabularyIsClosed:
     """`severity` is closed for the same reason: this reaches a website nobody
     has redeployed, and a word invented later must not read as 'fine'."""
 
-    KNOWN = {"ok", "not_modified", "wall", "robots", "circuit", "dns", "tls",
-             "connect", "timeout", "http_4xx", "http_5xx", "http2", "error"}
-
     def test_every_shape_resolves_to_a_known_word(self):
+        # Checked against the shipped constant rather than a copy of it. The
+        # copy could only ever agree with itself; `FAILURE_KINDS` is what the
+        # severity and owner maps are built from, so this now also catches a
+        # word that reaches those maps unclassified.
         for r in (_resp(status=200), _resp(status=304, from_cache=True),
                   _resp(status=403, text="x", wall="access denied"),
                   _resp(status=404), _resp(status=500), _resp(status=0),
                   _resp(error="SomethingNobodyAnticipated: x")):
-            assert failure_kind(r) in self.KNOWN
+            assert failure_kind(r) in FAILURE_KINDS
 
     def test_a_wall_outranks_its_status_code(self):
         """A 403 carrying a challenge is a wall, not an ordinary 4xx."""

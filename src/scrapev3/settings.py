@@ -290,6 +290,11 @@ class Settings:
     # it may add them, and an operator turning on the first has not agreed to
     # the second.
     requests: str = field(default_factory=lambda: _env("REQUESTS", "off").strip().lower())
+    # Whether a pass records its failures to data/faults.sqlite. ON by default,
+    # unlike the three above: those need MySQL and a crawler that cannot reach
+    # it should not guess, whereas this needs a local file and nothing else. A
+    # diagnostic that is off by default is one nobody has when they need it.
+    faults: str = field(default_factory=lambda: _env("FAULTS", "on").strip().lower())
 
     @property
     def tns_sink_enabled(self) -> bool:
@@ -306,6 +311,10 @@ class Settings:
     @property
     def requests_enabled(self) -> bool:
         return self.requests in {"on", "true", "1", "yes"}
+
+    @property
+    def faults_enabled(self) -> bool:
+        return self.faults in {"on", "true", "1", "yes"}
 
     @property
     def browser_enabled(self) -> bool:
