@@ -234,6 +234,77 @@ class TestWhatTheCrawlHandsOver:
         assert "faults" not in payload, "those are rows, not a JSON blob"
 
 
+class TestAFailedFetchReachesTheStore:
+    """The join the two halves above do not cover.
+
+    `failure_kind` is tested on Responses and the store is tested on rows, but
+    the wire between them runs through `_extract_ref` - and that is where the
+    old free-text key was built. A stub fetcher is enough: no network, and the
+    whole point is what happens to a response that is not ok.
+    """
+
+    class _Fetcher:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def get(self, url, **kw):
+            return self._resp
+
+    async def _run(self, resp, url="https://x.mil/news/a"):
+        from scrapev3.crawl import CrawlStats, _extract_ref
+        from scrapev3.discover.sources import ArticleRef
+
+        stats = CrawlStats()
+        article = await _extract_ref(self._Fetcher(resp), ArticleRef(url=url),
+                                     stats, "x.mil", 42)
+        assert article is None
+        return stats
+
+    async def test_the_kind_is_counted_attributed_and_recorded(self):
+        stats = await self._run(_resp(
+            status=0, error="DNSError: getaddrinfo failed for x.mil"))
+
+        assert stats.failed == 1
+        assert stats.by_failure == {"dns": 1}
+        assert stats.failure_domains == {"dns": {"x.mil"}}
+        assert stats.faults[("dns", "x.mil")][0] == 1
+        assert stats.faults[("dns", "x.mil")][1] == 42, "the a_id travels"
+
+    async def test_the_message_survives_as_a_sample(self):
+        # Keyed on the kind, so the message has to be kept somewhere or "dns
+        # x20" becomes a summary nobody can act on.
+        stats = await self._run(_resp(status=0, error="DNSError: boom"))
+
+        assert "boom" in stats.failure_sample["dns"]
+        assert "boom" in stats.faults[("dns", "x.mil")][3]
+
+    async def test_a_robots_refusal_is_not_a_failure_and_not_a_fault(self):
+        # It was already kept out of `failed`; it must stay out of the store
+        # too, or the ranked list opens with a rule we are correctly obeying.
+        stats = await self._run(_resp(status=0, error="robots-disallow"))
+
+        assert stats.robots_disallowed == 1
+        assert stats.failed == 0
+        assert stats.faults == {}
+
+    async def test_two_urls_one_row(self):
+        # End to end: the fragmentation this change exists to stop.
+        from scrapev3.crawl import CrawlStats, _extract_ref
+        from scrapev3.discover.sources import ArticleRef
+
+        stats = CrawlStats()
+        for host in ("a", "b"):
+            resp = _resp(status=0,
+                         error=f"ConnectTimeout: failed to connect to {host}:443")
+            await _extract_ref(self._Fetcher(resp),
+                               ArticleRef(url=f"https://x.mil/{host}"), stats,
+                               "x.mil", 42)
+
+        assert stats.by_failure == {"connect": 2}
+        assert list(stats.faults) == [("connect", "x.mil")]
+        assert stats.faults[("connect", "x.mil")][0] == 2
+
+
 class TestTheRollUp:
 
     def test_one_kind_across_many_domains_is_one_ranked_row(self):
