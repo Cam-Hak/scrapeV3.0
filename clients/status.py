@@ -36,6 +36,12 @@ COLUMNS = (
     "targets_cached", "feed_url", "feed_absent", "probed_at", "conditional_get",
     "next_due_at", "crawl_delay_s", "revisit_period_s", "first_stored_at",
     "last_stored_at", "tns_loaded", "tns_pending",
+    # Which kind of refusal, when there was one: `challenge` | `refused` |
+    # `unresolved` | `js_rendered`, or NULL when nothing refused us.
+    "access",
+    # And what specifically broke on the last pass that touched this agency.
+    # `reason` explains the verdict; these two carry the cause.
+    "fault_kind", "fault_detail",
     "updated_at",
 )
 _COLUMN_LIST = ", ".join(COLUMNS)

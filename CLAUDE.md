@@ -169,6 +169,18 @@ feed/wp-json bodies are `FEED`/`CMS_API`, not `TRAFILATURA`.
   `fetch/client.py` has no business knowing what `extract_no_date` costs. `by_failure` is keyed on the kind, never on
   `resp.error` - that string carries the URL, so it used to fragment one cause
   into one row per article.
+- **Derived locally, published on the wire - same rule, opposite mechanics.**
+  `severity`/`owner`/`score` are NOT columns in `data/faults.sqlite`, so a rule
+  change re-ranks every run in history. They ARE columns in
+  `scrapev3.crawl_fault`, because the website has no classifier and re-deriving
+  a rank in PHP is the second definition of "worth fixing" that `status.py`
+  exists to prevent. Both follow from one rule living in Python.
+  `crawl_fault` is one row per *kind* across the corpus and is an operations
+  view - never put it on a publisher-facing page; `agency_status.fault_kind`
+  is the per-agency half. A column added to either table must also be added to
+  `clients/*.php` and `clients/*.py`, which select by name:
+  `tests/test_fault_client.py` pins that, after `access` was published by
+  `57b81b4` and read by neither client.
 - **`policy` is weighted zero, and that is the whole point of the owner axis.**
   Robots refusals and bot walls are recorded with every domain attributed and
   never rank. Counting them as defects puts a rule we are correctly obeying at

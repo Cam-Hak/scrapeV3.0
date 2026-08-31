@@ -14,7 +14,7 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
-from .fetch import owner_of as fetch_owner_of
+from .faults import owner_of as fetch_owner_of
 from .settings import Settings
 from .survey import read_sites, run_survey, summarize
 

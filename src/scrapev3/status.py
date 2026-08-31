@@ -121,6 +121,8 @@ CREATE TABLE IF NOT EXISTS agency_status (
   tns_loaded        INT NOT NULL DEFAULT 0,
   tns_pending       INT NOT NULL DEFAULT 0,
   access            VARCHAR(16) NULL,
+  fault_kind        VARCHAR(32) NULL,
+  fault_detail      VARCHAR(255) NULL,
   updated_at        DATETIME NOT NULL,
   PRIMARY KEY (a_id),
   KEY idx_status_severity (severity),
@@ -151,6 +153,11 @@ _MIGRATIONS = (
     ("tns_loaded", "INT NOT NULL DEFAULT 0"),
     ("tns_pending", "INT NOT NULL DEFAULT 0"),
     ("access", "VARCHAR(16) NULL"),
+    # What specifically broke last time. `reason` explains the verdict and can
+    # only ever restate the counters behind it - "3 crawls in a row failed" -
+    # so it could never say WHY. These two carry the cause.
+    ("fault_kind", "VARCHAR(32) NULL"),
+    ("fault_detail", "VARCHAR(255) NULL"),
 )
 
 # Written and read by name, never by position: the website selects columns
@@ -169,6 +176,10 @@ COLUMNS = (
     # Which kind of refusal, when there was one. Appended after the first
     # deployment, so it is in `_MIGRATIONS` too.
     "access",
+    # The worst thing that happened to this agency on the last pass that
+    # touched it. Published rather than derived, because the website has no
+    # classifier - the same reason `health` and `severity` are published.
+    "fault_kind", "fault_detail",
     "updated_at",
 )
 
@@ -215,6 +226,9 @@ class AgencyStatus:
     tns_loaded: int = 0
     tns_pending: int = 0
     access: str | None = None
+
+    fault_kind: str | None = None
+    fault_detail: str | None = None
 
     updated_at: datetime | None = None
 
@@ -305,7 +319,8 @@ def _plural(n: int, noun: str) -> str:
 
 
 def compose(frontier: "Frontier", sink: "Sink", *,
-            now: datetime | None = None) -> list[AgencyStatus]:
+            now: datetime | None = None,
+            faults: dict[int, tuple[str, str]] | None = None) -> list[AgencyStatus]:
     """Build one row per agency from the local stores.
 
     The two stores are queried separately and merged here rather than joined in
@@ -422,6 +437,12 @@ def compose(frontier: "Frontier", sink: "Sink", *,
             now=now,
         )
         status.severity = severity_of(status.health)
+        # Only for agencies this pass actually touched. A row left alone keeps
+        # whatever it last reported, because "no fault this pass" and "not
+        # crawled this pass" are different things, and blanking it would say
+        # the first when it meant the second.
+        if faults and status.a_id in faults:
+            status.fault_kind, status.fault_detail = faults[status.a_id]
         status.updated_at = now
 
     return sorted(merged.values(), key=lambda s: s.a_id)

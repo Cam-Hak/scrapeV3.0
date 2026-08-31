@@ -65,6 +65,11 @@ const SCRAPEV3_STATUS_COLUMNS =
     . 'targets_cached, feed_url, feed_absent, probed_at, conditional_get, '
     . 'next_due_at, crawl_delay_s, revisit_period_s, first_stored_at, '
     . 'last_stored_at, tns_loaded, tns_pending, '
+    // Which kind of refusal, when there was one: challenge | refused |
+    // unresolved | js_rendered, or NULL when nothing refused us. And what
+    // specifically broke last pass - `reason` explains the verdict, these
+    // carry the cause.
+    . 'access, fault_kind, fault_detail, '
     . 'updated_at';
 
 /** The same names as an array, for checking a caller's sort key against. */

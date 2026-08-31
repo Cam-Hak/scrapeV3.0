@@ -398,6 +398,131 @@ def new_run_id() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Publishing, for the website
+# ---------------------------------------------------------------------------
+
+# One row per kind, not per (kind, domain): the website's question is "what is
+# wrong across the corpus", and the domains that raised it belong in the row as
+# a list rather than as 600 rows to GROUP BY on every page load.
+#
+# `severity`, `owner`, `score` and `band` ARE columns here, and are deliberately
+# NOT columns in the local store. The rule is the same in both places - one
+# definition, in Python - but the mechanics invert: locally the classifier is a
+# function call away, so deriving keeps history re-rankable; on the wire the
+# consumer has no classifier at all, and making PHP re-derive a severity is the
+# second definition `status.py` exists to prevent.
+_PUBLISH_DDL = """
+CREATE TABLE IF NOT EXISTS crawl_fault (
+  kind          VARCHAR(32) NOT NULL,
+  severity      TINYINT NOT NULL,
+  owner         VARCHAR(8) NOT NULL,
+  domains       SMALLINT NOT NULL DEFAULT 0,
+  occurrences   INT NOT NULL DEFAULT 0,
+  score         FLOAT NOT NULL DEFAULT 0,
+  band          VARCHAR(8) NOT NULL,
+  example_domain VARCHAR(255) NULL,
+  sample_url    TEXT NULL,
+  sample_detail VARCHAR(255) NULL,
+  run_id        VARCHAR(32) NOT NULL,
+  updated_at    DATETIME NOT NULL,
+  PRIMARY KEY (kind),
+  KEY idx_fault_owner (owner),
+  KEY idx_fault_score (score)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
+
+PUBLISH_COLUMNS = ("kind", "severity", "owner", "domains", "occurrences",
+                   "score", "band", "example_domain", "sample_url",
+                   "sample_detail", "run_id", "updated_at")
+
+
+def connect(settings) -> Any:
+    """Open the state database. Same schema as `agency_status`."""
+    from .removal import connect as _connect
+
+    return _connect(settings)
+
+
+def ensure_published_table(conn: Any) -> None:
+    with conn.cursor() as cur:
+        cur.execute(_PUBLISH_DDL)
+    conn.commit()
+
+
+def publish(conn: Any, rows: Iterable[FaultRow], run_id: str) -> int:
+    """Upsert the ranked corpus view. A snapshot, not a log.
+
+    Replaces every column, so re-running produces the same table and it is safe
+    to run after every pass and by hand at the same time - the property
+    `status.publish` has, for the same reason.
+    """
+    ranked = tally(rows)
+    if not ranked:
+        return 0
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    values = [(t.kind, t.severity, t.owner, len(t.domains), t.occurrences,
+               round(t.score, 1), t.band,
+               t.domains[0] if t.domains else None,
+               t.sample_url, (t.sample_detail or "")[:255] or None,
+               run_id, now)
+              for t in ranked]
+    marks = ", ".join(["%s"] * len(PUBLISH_COLUMNS))
+    updates = ", ".join(f"{c} = VALUES({c})" for c in PUBLISH_COLUMNS
+                        if c != "kind")
+    with conn.cursor() as cur:
+        cur.executemany(
+            f"INSERT INTO crawl_fault ({', '.join(PUBLISH_COLUMNS)}) "
+            f"VALUES ({marks}) ON DUPLICATE KEY UPDATE {updates}", values)
+    conn.commit()
+    log.debug("published %d fault kinds", len(values))
+    return len(values)
+
+
+def prune_published(conn: Any, keep: Iterable[str]) -> int:
+    """Drop kinds that did not occur this pass.
+
+    Without it a fault fixed last week stays on the website's tracker forever,
+    which is the same failure `status.prune` exists to stop: a row nobody is
+    still earning. The local store keeps the history; this table is current
+    state only.
+    """
+    keep = sorted(set(keep))
+    with conn.cursor() as cur:
+        if not keep:
+            cur.execute("DELETE FROM crawl_fault")
+        else:
+            marks = ", ".join(["%s"] * len(keep))
+            cur.execute(f"DELETE FROM crawl_fault WHERE kind NOT IN ({marks})",
+                        tuple(keep))
+        deleted = cur.rowcount
+    conn.commit()
+    return deleted
+
+
+def worst_for_agency(rows: Iterable[FaultRow]) -> dict[int, tuple[str, str]]:
+    """The worst thing that happened to each agency: a_id -> (kind, detail).
+
+    For `agency_status`, which answers "why is this row red" and could only ever
+    say "3 crawls in a row failed" - a restatement of its own counter rather
+    than the cause. Worst by severity, then by whether it is ours, so a site
+    that both timed out and crashed the crawl reports the crash.
+
+    `policy` is included here, unlike the ranked list: on one agency's row "the
+    publisher declined us" is the answer, not noise.
+    """
+    best: dict[int, tuple[int, int, str, str]] = {}
+    for row in rows:
+        if row.a_id is None:
+            continue
+        rank = (severity_of(row.kind), 1 if owner_of(row.kind) == "us" else 0)
+        current = best.get(row.a_id)
+        if current is None or rank > current[:2]:
+            best[row.a_id] = (rank[0], rank[1], row.kind,
+                              row.sample_detail or "")
+    return {a: (kind, detail) for a, (_, _, kind, detail) in best.items()}
+
+
+# ---------------------------------------------------------------------------
 # The store
 # ---------------------------------------------------------------------------
 

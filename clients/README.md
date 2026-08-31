@@ -9,6 +9,7 @@ not a socket, not a shared filesystem.
 | Remove an agency | `scrapev3.removed_agency` | the website | the crawler |
 | Request a site | `scrapev3.requested_site` | the website | the crawler |
 | Show crawl health and inventory | `scrapev3.agency_status` | the crawler | the website |
+| Track what is going wrong | `scrapev3.crawl_fault` | the crawler | the website |
 
 Neither side calls the other. Both are reads and writes against shared state, so
 there is no service to run, no port to hold open, and nothing to restart when
@@ -19,6 +20,7 @@ the other side is down.
 | `remove_agency.php` / `.py` | Write side: record a removal |
 | `request_site.php` / `.py` | Write side: ask for a site to be crawled |
 | `status.php` / `.py` | Read side: health *and* inventory, **data only, no rendering** |
+| `faults.php` / `.py` | Read side: what is going wrong with the crawl, ranked |
 | `example.php` | **Start here.** The fetch, then a table to replace with your own |
 | `status_demo.php` | A throwaway page for looking at the data. Not for production |
 
@@ -68,6 +70,7 @@ CREATE USER 'website'@'%' IDENTIFIED BY '...';
 GRANT SELECT, INSERT ON scrapev3.removed_agency TO 'website'@'%';
 GRANT SELECT, INSERT ON scrapev3.requested_site TO 'website'@'%';
 GRANT SELECT         ON scrapev3.agency_status  TO 'website'@'%';
+GRANT SELECT         ON scrapev3.crawl_fault    TO 'website'@'%';
 ```
 
 `SELECT` on `removed_agency` is there so the site can show what it has already
@@ -313,6 +316,75 @@ the grid. To refresh it by hand, or the first time:
 ```bash
 scrapev3 status --publish
 ```
+
+---
+
+# Tracking what is going wrong
+
+Two questions, two tables, and conflating them is the mistake to avoid.
+`agency_status` answers **"is this publisher being collected?"** — one row per
+agency, safe on a page a publisher might see. `crawl_fault` answers **"what is
+wrong with the crawler?"** — one row per failure kind across the whole corpus,
+for whoever operates it. `dns × 20` is our operational detail and means nothing
+to a newsroom, so do not put it on a publisher-facing page.
+
+```php
+require 'faults.php';
+
+$worst = scrapev3_faults($pdo);           // ranked, worst first
+$mine  = scrapev3_faults($pdo, 'us');     // the to-do list
+```
+
+Each row already carries its own verdict, so nothing is re-derived:
+
+| Column | Use it for |
+|---|---|
+| `kind` | the **label** — `dns`, `tls`, `http_4xx`, `discover_failed`, `extract_body_is_chrome`, … |
+| `owner` | **whose problem** — `us`, `site` or `policy`, and the only closed one |
+| `severity` | 1, 2 or 3 — the same scale the audit uses |
+| `score`, `band` | the **ranking** — order by `score`, colour by `band` (`urgent`/`notable`/`minor`) |
+| `domains`, `occurrences` | how wide, and how many |
+| `example_domain`, `sample_detail` | one site and one message, so a row is actionable |
+
+**Order by `score`, not by `occurrences`.** The crawler ranks on severity × how
+many *domains* raised it × whose problem it is. One site 404ing forty URLs and
+twenty sites failing once each are the same total and completely different
+problems, and sorting on volume puts the wrong one first. Re-deriving the rank
+in PHP would be a second definition of "worth fixing" that drifts from the
+crawler's — the same trap as re-deriving `health`.
+
+**`policy` rows score 0 and never lead.** A robots.txt we obeyed and a bot wall
+are returned so they can be counted, and they are weighted to nothing so they
+cannot fill the top of a work queue. Hide them by default; show them under a
+toggle.
+
+**It is a snapshot, not a log.** The table is rewritten each pass and pruned of
+anything that stopped happening, so a kind fixed last week disappears rather
+than lingering. History lives on the crawler — `scrapev3 faults --runs 7`. Show
+`updated_at` for the usual reason: a batch job that stops running leaves a
+tracker that looks exactly like a quiet week.
+
+## And per agency, with no second query
+
+`agency_status` gained two columns, so the grid you already read says what
+specifically broke:
+
+```php
+$row = scrapev3_status($pdo, 22385);
+$row['fault_kind'];     // 'dns'
+$row['fault_detail'];   // 'DNSError: getaddrinfo failed'
+```
+
+`reason` explains the *verdict* and can only ever restate the counters behind it
+— "3 crawls in a row failed". These two carry the *cause*. They are set only for
+agencies the last pass actually touched: an untouched row keeps what it last
+reported, because "no fault this pass" and "not crawled this pass" are different
+things.
+
+Unlike the ranked list, a `policy` refusal **is** reported here. On one agency's
+row "the publisher declined us" is the answer, not noise.
+
+---
 
 ## Looking at the data before wiring any of it up
 

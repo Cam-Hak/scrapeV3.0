@@ -123,6 +123,20 @@ class CrawlStats:
         else:
             entry[0] += 1
 
+    def fault_rows(self) -> list:
+        """This pass's faults as `FaultRow`s, for the publishers.
+
+        The dict is the accumulation shape - cheap to bump inside the
+        per-article loop. This is the shape everything that reads them wants,
+        and converting once here keeps it out of three callers.
+        """
+        from .faults import FaultRow
+
+        return [FaultRow(run_id="", kind=kind, domain=domain, n=entry[0],
+                         a_id=entry[1], first_at="", last_at="",
+                         sample_url=entry[2], sample_detail=entry[3])
+                for (kind, domain), entry in self.faults.items()]
+
     def to_dict(self) -> dict:
         """The counters, JSON-safe, for `fault_run.stats_json`.
 
@@ -558,7 +572,39 @@ def _persist_faults(settings: Settings, stats: CrawlStats, run_id: str,
         return 0
     finally:
         store.close()
+
+    # The website's copy, and a separate failure: MySQL being unreachable must
+    # not lose the local record that was already written above.
+    if settings.status_enabled:
+        _publish_faults(settings, stats, run_id)
     return len(stats.faults)
+
+
+def _publish_faults(settings: Settings, stats: CrawlStats, run_id: str) -> int:
+    """Publish the ranked corpus view for the website. Never raises.
+
+    Gated on `SCRAPEV3_STATUS`, not on `SCRAPEV3_FAULTS`: it goes to the same
+    MySQL as `agency_status`, for the same reader, and an operator who turned
+    the grid off did not ask for half of it.
+    """
+    from . import faults as faults_mod
+
+    try:
+        conn = faults_mod.connect(settings)
+    except Exception as exc:                                # noqa: BLE001
+        stats.errors.append(f"faults not published: {type(exc).__name__}: {exc}")
+        return 0
+    try:
+        rows = stats.fault_rows()
+        faults_mod.ensure_published_table(conn)
+        written = faults_mod.publish(conn, rows, run_id)
+        faults_mod.prune_published(conn, {r.kind for r in rows})
+        return written
+    except Exception as exc:                                # noqa: BLE001
+        stats.errors.append(f"faults not published: {type(exc).__name__}: {exc}")
+        return 0
+    finally:
+        conn.close()
 
 
 def _publish_status(settings: Settings, frontier: Frontier, sink: Sink,
@@ -575,9 +621,11 @@ def _publish_status(settings: Settings, frontier: Frontier, sink: Sink,
     recomputed or it stays green forever.
     """
     from . import status as status_mod
+    from .faults import worst_for_agency
 
     try:
-        rows = status_mod.compose(frontier, sink)
+        rows = status_mod.compose(frontier, sink,
+                                  faults=worst_for_agency(stats.fault_rows()))
         conn = status_mod.connect(settings)
     except Exception as exc:                                # noqa: BLE001
         stats.errors.append(f"status not published: {type(exc).__name__}: {exc}")
