@@ -111,7 +111,23 @@ feed/wp-json bodies are `FEED`/`CMS_API`, not `TRAFILATURA`.
   Each must overlap with links on the target's own page, and at least 50% of what
   it returns must be this publisher's own domain (`usable()` in
   `discover/sources.py`). Three sites needed three separate patches before this
-  was made general.
+  was made general. **A declared feed is not exempt.** `<link rel="alternate">`
+  proves ownership, not scope, and WordPress emits the site-wide `/feed` into
+  every page it renders — so the declaration is honoured only while the feed is
+  at least as specific as the section it was declared on
+  (`_declaration_is_scoped`). 64 of 1,747 audited targets stored the wrong
+  documents through that hole. The unscoped-sitemap **reserve** is the
+  deliberate exception: corroborating it was tried and reverted, because these
+  newsrooms are JS-rendered and overlap is zero whether the sitemap is right or
+  wrong — it dropped `nyclu.org`, which was right, as readily as `bny.com`,
+  which was wrong. Those belong in per-domain data. See README, *The
+  declaration hole*; `tests/test_corroboration.py` pins all three.
+- **Discovery applies the crawl's own URL gate, not just the crawl.** A sitemap
+  lists every URL the CMS knows — `sanjac.edu`'s offers `/about/news/_nav.ounav`
+  and `/about/news/index.php` under the right prefix. Counted as yield they
+  satisfy `usable()`, win the cascade and cache as the method, and every crawl
+  then gates them away and stores nothing: `empty` by another road. News-sitemap
+  entries are exempt, for the reason feeds are.
 - **"Found articles" is not success.** A source returning only the listing page
   itself, or another publisher's content, must be rejected *inside* discovery —
   otherwise it caches as the winning method and the cascade never retries.
@@ -182,6 +198,37 @@ feed/wp-json bodies are `FEED`/`CMS_API`, not `TRAFILATURA`.
   publisher has not posted) is *not* a fault, and `empty` (we crawl it fine and
   store nothing) is a different fault from `stale` (we stopped reaching it) —
   `empty` was 92 of the first 324 agencies crawled. Off unless `SCRAPEV3_STATUS=on`.
+- **`robots_agent` decides what we obey; `user_agent` only decides what we
+  say.** `Protego.can_fetch` keys entirely on the string handed to it, so the
+  two must never be the same field. 55 of 1,747 targets 403 the bot UA and
+  serve a browser one (`defense.gov`, `weforum.org`, `michigan.gov` — verified
+  with TLS and every other header held constant), while their robots.txt
+  returns `can_fetch = True` for us. The browser string is therefore a repair
+  path: tried once, only after a 403 or a wall, remembered per domain, with
+  `From:` sent either way. Point robots matching at the sent UA and presenting
+  a browser string silently widens what we are allowed to fetch — that is the
+  regression `tests/test_identity.py` exists to catch. Leading with the honest
+  UA is also what keeps Cloudflare Verified Bots reachable.
+- **`status = 0` is four different things.** A transport exception, an open
+  circuit breaker, a robots refusal, and a `Response` nobody filled in.
+  `fetch.failure_kind` is the closed vocabulary over them, closed for the same
+  reason `severity` is. The audit recorded `resp.wall` and had *no branch* for
+  `resp.error`, so 108 of 149 unreachable targets reached the website with
+  their reason discarded and were scored as the publisher's fault — including
+  20 `.mil` agencies that only our own resolver could not resolve. A `robots`
+  refusal is not a finding; `dns` and `circuit` are findings against us.
+- **The browser tier is pointed at rendering, not at refusals.** Off unless
+  `SCRAPEV3_BROWSER=on`, and it escalates only a domain the frontier already
+  marked `js_rendered` — a site that never refused us and simply renders its
+  articles in JavaScript. `challenge` needs a second switch
+  (`SCRAPEV3_BROWSER_CHALLENGES`) because a challenge page *is* a site
+  declining an identified crawler. `refused` is never escalated: of 41 walls,
+  30 were flat `access denied`, which Chrome renders identically. Every render
+  runs inside `PoliteFetcher._paced` — the same context manager `_raw_get`
+  uses — so politeness is structural, and the gate sits in `_get_once` *below*
+  the robots check so there is no second route to a disallowed URL.
+  After the DNS and identity fixes the whole corpus had **8** genuine walls
+  left, so measure before investing here.
 - **Discovery can change which domain a target belongs to.** A publisher that
   redirects to a new home (`dni.gov` -> `odni.gov`) has its identity re-derived
   mid-cascade, so downstream code must read `Discovery.target_domain` rather than

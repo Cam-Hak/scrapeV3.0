@@ -1,0 +1,66 @@
+Crawling up to 8 domains, max 5 articles each, window 400d
+TNSNewsBot/1.0 (+https://targetednews.com/bot) | 5.0s/host, 1 concurrent/host, 
+4 concurrent/IP
+Sink: JSONL only (--sink tns to load press_release)
+
+crawling usc.edu ---------------------------------------- 8/8 0:47:02
+                  Crawl result                   
+┌───────────────────────────────────────┬───────┐
+│ Metric                                │ Count │
+├───────────────────────────────────────┼───────┤
+│ Domains leased                        │     8 │
+│ Newsroom URLs crawled                 │    11 │
+│ Articles discovered                   │   156 │
+│   already seen (skipped before fetch) │     9 │
+│   pages fetched                       │    72 │
+│   stored                              │    43 │
+│   unusable (short/no date)            │    11 │
+│   older than the window               │    23 │
+│   off-domain (wrong publisher)        │     0 │
+│   non-news (events/staff/courses)     │     0 │
+│   robots.txt disallowed               │     0 │
+│   needed a browser                    │    10 │
+│   body text dupes                     │     1 │
+│   failed                              │     0 │
+└───────────────────────────────────────┴───────┘
+Discovery method used
+┌─────────┬─────────┐
+│ Method  │ Domains │
+├─────────┼─────────┤
+│ listing │       5 │
+│ sitemap │       4 │
+│ cms_api │       1 │
+│ rss     │       1 │
+└─────────┴─────────┘
+             Why articles were unusable             
+┌─────────────────────────────┬──────────┬─────────┐
+│ Reason                      │ Articles │ Domains │
+├─────────────────────────────┼──────────┼─────────┤
+│ body under 300 chars        │       10 │ usc.edu │
+│ body looks like page chrome │        1 │ usc.edu │
+└─────────────────────────────┴──────────┴─────────┘
+ Where the body came from 
+┌─────────────┬──────────┐
+│ Source      │ Articles │
+├─────────────┼──────────┤
+│ trafilatura │       62 │
+│ none        │       10 │
+│ cms_api     │        5 │
+└─────────────┴──────────┘
+
+8 note(s) - sources declined for the right reasons:
+  edisonohio.edu: ignoring site-wide feed https://edisonohio.edu/rss.xml: none 
+of its items appear under /news
+  falmouth.ac.uk: ignoring site-wide feed https://falmouth.ac.uk/rss.xml: none 
+of its items appear under /news
+  falmouth.ac.uk: sitemap matched nothing under /news; preferring the listing 
+page
+  usc.edu: sitemap matched nothing under /about/news; preferring the listing 
+page
+  ccu.edu: sitemap matched nothing under /news; preferring the listing page
+  soas.ac.uk: ignoring site-wide feed https://soas.ac.uk/rss.xml: none of its 
+items appear under /about/news
+
+Total stored to date: 83 articles across 16 domains
+Output: data\articles\articles-20260831.jsonl
+Inspect with: scrapev3 show

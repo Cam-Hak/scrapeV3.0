@@ -1,0 +1,120 @@
+{
+  "targets": 148,
+  "verdicts": {
+    "broken": 53,
+    "suspicious": 27,
+    "ok": 40,
+    "check": 28
+  },
+  "methods": {
+    "none": 76,
+    "rss": 8,
+    "sitemap": 11,
+    "listing": 50,
+    "cms_api": 3
+  },
+  "findings": {
+    "unreachable": 45,
+    "low_overlap": 3,
+    "no_overlap": 3,
+    "scattered": 27,
+    "last_resort": 50,
+    "no_articles": 4,
+    "unscoped": 3,
+    "page_too_thin": 1,
+    "off_domain": 1
+  },
+  "median_overlap": 1.0,
+  "zero_yield": 4,
+  "unreachable": 72,
+  "pct_clean": 27.0,
+  "by_tld": {
+    ".com": {
+      "targets": 40,
+      "ok": 9,
+      "workable": 19,
+      "pct_workable": 47.5
+    },
+    ".org": {
+      "targets": 29,
+      "ok": 13,
+      "workable": 18,
+      "pct_workable": 62.1
+    },
+    ".edu": {
+      "targets": 22,
+      "ok": 8,
+      "workable": 10,
+      "pct_workable": 45.5
+    },
+    ".mil": {
+      "targets": 20,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".gov": {
+      "targets": 18,
+      "ok": 4,
+      "workable": 12,
+      "pct_workable": 66.7
+    },
+    ".uk": {
+      "targets": 6,
+      "ok": 1,
+      "workable": 3,
+      "pct_workable": 50.0
+    },
+    ".ca": {
+      "targets": 4,
+      "ok": 2,
+      "workable": 2,
+      "pct_workable": 50.0
+    },
+    ".au": {
+      "targets": 3,
+      "ok": 1,
+      "workable": 2,
+      "pct_workable": 66.7
+    },
+    ".in": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".eu": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".mo": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".int": {
+      "targets": 1,
+      "ok": 0,
+      "workable": 0,
+      "pct_workable": 0.0
+    },
+    ".ch": {
+      "targets": 1,
+      "ok": 1,
+      "workable": 1,
+      "pct_workable": 100.0
+    },
+    ".fi": {
+      "targets": 1,
+      "ok": 1,
+      "workable": 1,
+      "pct_workable": 100.0
+    }
+  },
+  "extraction": {
+    "probed": 0
+  }
+}

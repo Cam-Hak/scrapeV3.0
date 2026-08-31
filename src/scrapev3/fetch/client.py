@@ -36,7 +36,9 @@ import asyncio
 import random
 import socket
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
 
 from curl_cffi.requests import AsyncSession
@@ -81,6 +83,21 @@ class Response:
         return self.error is None and self.wall is None and 200 <= self.status < 300
 
     @property
+    def reached(self) -> bool:
+        """The origin answered. A 304 is a successful fetch carrying no body.
+
+        `ok` cannot express this, because `ok` also means "there is content
+        here to parse" and every caller relies on that. Arming conditional GET
+        without a separate word for it would make every unchanged feed read as
+        a failed fetch: discovery returns `method="none"`, the target is
+        released with `success=False`, the persistent failure counter climbs,
+        and three days later the website tells the publisher their site is
+        failing - because nothing had changed on it. That is a worse bug than
+        the request volume it was meant to save.
+        """
+        return self.error is None and self.wall is None and (self.ok or self.from_cache)
+
+    @property
     def html(self) -> str:
         return self.text
 
@@ -100,6 +117,12 @@ class _HostState:
     # because the failures that tripped it happened during discovery and the
     # article fetches that followed only ever saw the open circuit.
     blocked_reason: str | None = None
+    # The last refusal this host served, kept so the frontier can record WHAT
+    # refused us and not merely that something did. A challenge and a flat
+    # denial need different words: one might be worth a browser, the other is
+    # the publisher saying no.
+    last_wall: str | None = None
+    last_refused_status: int = 0
 
     def observe_latency(self, seconds: float) -> None:
         self.latencies.append(seconds)
@@ -117,6 +140,132 @@ class _HostState:
 # the URL itself - only about the host name. Formatted by _raw_get as
 # "{type(exc).__name__}: {exc}".
 _NO_SERVER_ERRORS = ("DNSError", "SSLError", "ConnectionError", "ConnectTimeout")
+
+
+def failure_kind(resp: "Response") -> str:
+    """One word for why this fetch produced nothing. Pure; no I/O.
+
+    `status = 0` is produced at four unrelated places - a transport exception,
+    an open circuit breaker, a robots refusal, and a Response nobody filled in
+    - and every consumer downstream saw the same undifferentiated zero. The
+    audit stored it and threw the reason away, so 67 targets read as "the
+    publisher's site is down" when 20 of them were our own resolver failing to
+    answer for `.mil` at all. `nslookup www.centcom.mil 1.1.1.1` returns an
+    address instantly; the local resolver returned `getaddrinfo failed`.
+
+    Blaming a publisher for our own broken resolver is the same class of
+    silent-quality bug as crediting a body to the wrong source: nothing raises,
+    and the wrong answer is perfectly plausible.
+
+    A CLOSED vocabulary, for the reason `severity` is closed in `status.py`:
+    this ends up on a website nobody has redeployed, so a word invented later
+    must not silently mean "fine".
+    """
+    if resp.wall:
+        return "wall"
+    if resp.error:
+        err = resp.error
+        if err.startswith("robots-disallow"):
+            return "robots"          # not a failure at all - the rule working
+        if err.startswith("circuit-open"):
+            return "circuit"
+        if err.startswith("DNSError"):
+            return "dns"
+        # curl_cffi raises CertificateVerifyError rather than SSLError for an
+        # expired or untrusted chain, and the re-audit found 8 targets landing
+        # in the catch-all "error" bucket for exactly that reason - a distinct,
+        # actionable fault reported as "something went wrong".
+        if err.startswith(("SSLError", "CertificateVerifyError")):
+            return "tls"
+        # "HTTP/2 stream N reset by server (INTERNAL_ERROR)" - 7 targets in the
+        # re-audit. Its own word because it is the one failure here that is
+        # about the PROTOCOL rather than the site: the impersonation profile
+        # negotiates h2 and these servers cannot hold the stream open. Retrying
+        # such a host on HTTP/1.1 is the obvious next move, and it needs a name
+        # before it can be counted.
+        if err.startswith("HTTPError") and "HTTP/2" in err:
+            return "http2"
+        if err.startswith(("ConnectionError", "ConnectTimeout")):
+            return "connect"
+        if err.startswith(("Timeout", "browser-timeout")):
+            return "timeout"
+        return "error"
+    if resp.from_cache:
+        return "not_modified"
+    if resp.ok:
+        return "ok"
+    if 400 <= resp.status < 500:
+        return "http_4xx"
+    if resp.status >= 500:
+        return "http_5xx"
+    return "error"
+
+
+# Which refusals a browser could plausibly get past, and which it could not.
+# The distinction is load-bearing rather than cosmetic: of 41 walls in the
+# first corpus run, 30 were "access denied" - a flat refusal that renders the
+# same in Chrome - and only ~11 were interstitials that solve themselves once
+# JavaScript runs. Writing `needs_browser` for all 41 would put "the page needs
+# a browser to render its articles" on 30 publishers' rows as a false
+# statement, and queue browser work certain to fail.
+_CHALLENGE_WALLS = (
+    "just a moment",
+    "checking your browser",
+    "are you human",
+    "verify you are human",
+    "security check",
+    "one more step",
+    "js challenge",              # the CHALLENGE_MARKERS prefix
+)
+
+
+@dataclass(frozen=True)
+class HostVerdict:
+    """What a host did to us, in a word the frontier can store.
+
+    `access` is a CLOSED vocabulary, like `severity`:
+
+      challenge   an interstitial that JavaScript would clear - maybe a browser
+      refused     a flat denial. This is a site declining an identified
+                  crawler, and no amount of rendering changes it
+      unresolved  our own resolver could not answer. Ours to fix, not theirs
+    """
+
+    access: str
+    reason: str
+    failures: int
+
+
+def _retry_after_seconds(raw: str | None, default: float = 60.0) -> float:
+    """`Retry-After`, in seconds, from either form RFC 9110 allows.
+
+    The delta-seconds form is a bare integer; the other is an HTTP date. Only
+    the first was parsed, and the date form fell back to a flat 60 seconds -
+    so a server saying "come back in four hours" was asked again in one
+    minute, which is precisely the message it was trying not to have to send
+    again. Both forms are now believed.
+
+    Anything unparseable still floors at `default` rather than 0: a malformed
+    header is not permission to retry immediately.
+    """
+    if not raw:
+        return default
+    raw = raw.strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+
+        when = parsedate_to_datetime(raw)
+        if when is None:
+            return default
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except Exception:                                       # noqa: BLE001
+        return default
 
 
 def _with_www(url: str) -> str | None:
@@ -189,8 +338,14 @@ def detect_wall(html: str) -> str | None:
 class PoliteFetcher:
     """Async HTTP client that cannot be impolite by construction."""
 
-    def __init__(self, settings: Settings | None = None):
+    def __init__(self, settings: Settings | None = None,
+                 escalate: dict[str, str] | None = None):
         self.settings = settings or Settings.load()
+        # domain -> access verdict, supplied by the frontier. The fetcher never
+        # reads the frontier itself, and nothing here names a site: this is
+        # per-domain DATA, which is where CLAUDE.md puts site-specific facts.
+        self._escalate: dict[str, str] = dict(escalate or {})
+        self._browser = None
         self._hosts: dict[str, _HostState] = {}
         self._robots: dict[str, RobotsRules] = {}
         self._robots_locks: dict[str, asyncio.Lock] = {}
@@ -199,6 +354,13 @@ class PoliteFetcher:
         # Secondary per-IP constraint - see settings.max_concurrency_per_ip.
         self._dns_cache: dict[str, str | None] = {}
         self._ip_sems: dict[str, asyncio.Semaphore] = {}
+        # Hosts the resolver could not answer for, and why. `_resolve` already
+        # learned this and threw it away, so a resolver broken for a whole TLD
+        # looked exactly like 20 publishers whose sites were down.
+        self._dns_failures: dict[str, str] = {}
+        # Which User-Agent this host accepted, learned once per run after a
+        # refusal. Data keyed on a domain, never a branch naming one.
+        self._identity_for: dict[str, str] = {}
 
     async def _resolve(self, host: str) -> str | None:
         """Resolve and cache a hostname, so pacing can key on IP as well.
@@ -217,10 +379,113 @@ class PoliteFetcher:
                 timeout=self.settings.politeness.dns_timeout_s,
             )
             ip = infos[0][4][0] if infos else None
-        except Exception:
+        except Exception as exc:                            # noqa: BLE001
             ip = None
+            # Remembered, not swallowed. The distinction between "this host
+            # does not exist" and "our resolver cannot answer for it" is the
+            # difference between a finding against the publisher and a finding
+            # against us, and only this line knows which one happened.
+            self._dns_failures[host] = type(exc).__name__
+
+        # curl resolves the request itself, so a DoH-configured run fetches
+        # these hosts fine - but the per-IP concurrency cap keys on what WE
+        # resolved, and an unresolved host silently opts out of it. Ask the
+        # same DoH resolver curl is using, so the cap keeps applying to
+        # exactly the hosts that most need it: .mil is one Akamai edge.
+        if ip is None and self.settings.politeness.doh_url:
+            ip = await self._resolve_doh(host)
+            if ip is not None:
+                self._dns_failures.pop(host, None)
+
         self._dns_cache[host] = ip
         return ip
+
+    async def _resolve_doh(self, host: str) -> str | None:
+        """Resolve one A record through the configured DoH endpoint.
+
+        The JSON form (RFC 8484's `application/dns-json` companion), because
+        building and parsing wire-format DNS to learn one address would be a
+        parser we then have to own.
+        """
+        if self._session is None:
+            return None
+        try:
+            r = await asyncio.wait_for(
+                self._session.get(
+                    self.settings.politeness.doh_url,
+                    params={"name": host, "type": "A"},
+                    headers={"Accept": "application/dns-json"},
+                ),
+                timeout=self.settings.politeness.dns_timeout_s * 2,
+            )
+            for answer in (r.json().get("Answer") or []):
+                if answer.get("type") == 1:          # A record
+                    return answer.get("data")
+        except Exception:                                   # noqa: BLE001
+            return None
+        return None
+
+    def host_verdict(self, domain: str) -> "HostVerdict | None":
+        """What this host did to us, for the frontier to remember. Read-only.
+
+        The in-process refusal counter dies with the fetcher, and the
+        frontier's own counter never learned *why* - so `needs_browser` sat
+        wired end-to-end, through the status table and onto the website, with
+        nothing on earth writing it. This is the missing half.
+        """
+        state = self._hosts.get(domain)
+        host = ""
+        for name in self._dns_failures:
+            if name == domain or name.endswith("." + domain):
+                host = name
+                break
+        if host:
+            return HostVerdict("unresolved",
+                               "our resolver could not resolve this host",
+                               state.consec_failures if state else 0)
+        if state is None or not state.consec_failures:
+            return None
+        if state.last_wall:
+            wall = state.last_wall.lower()
+            if any(marker in wall for marker in _CHALLENGE_WALLS):
+                return HostVerdict("challenge", state.last_wall,
+                                   state.consec_failures)
+            return HostVerdict("refused", state.last_wall, state.consec_failures)
+        if state.last_refused_status == 403:
+            return HostVerdict("refused", "HTTP 403", state.consec_failures)
+        return None
+
+    @asynccontextmanager
+    async def _paced(self, domain: str, hostname: str, origin: str):
+        """Hold every pacing control for the duration of one fetch.
+
+        Lifted out of `_raw_get` so a second transport cannot accidentally be
+        less polite than the first. With the browser tier reusing this, "the
+        browser is exactly as polite as the fetcher" is a property of the code
+        rather than a sentence in a comment - it takes the global semaphore,
+        the per-host lock, the delay with jitter, and the per-IP cap, in that
+        order, because holding the IP semaphore across the pacing wait would
+        serialise every domain sharing a CDN edge.
+
+        Yields the per-IP semaphore (or None), which the caller holds only
+        around the request itself.
+        """
+        state = self._host_state(domain)
+        async with self._global_sem:
+            async with state.lock:          # concurrency-per-host == 1
+                await self._wait_turn(domain, self._effective_delay(
+                    domain, self._robots.get(origin)))
+                ip = await self._resolve(hostname)
+                yield self._ip_sem(ip) if ip else None
+
+    def resolver_report(self) -> tuple[int, int]:
+        """(hosts attempted, hosts that failed to resolve) for this run.
+
+        Read-only. A run where most hostnames fail to resolve is a local
+        infrastructure fault, and saying so once is worth more than saying
+        "site unreachable" once per publisher.
+        """
+        return len(self._dns_cache), len(self._dns_failures)
 
     def _ip_sem(self, ip: str) -> asyncio.Semaphore:
         sem = self._ip_sems.get(ip)
@@ -230,14 +495,22 @@ class PoliteFetcher:
         return sem
 
     async def __aenter__(self) -> "PoliteFetcher":
+        # Whatever ALPN the impersonation profile negotiates, kept deliberately
+        # unset. An earlier comment here claimed "HTTP/1.1 with keepalive", but
+        # no `http_version` was ever passed, so it described a decision the
+        # code never made - and a Chrome TLS fingerprint that then refuses the
+        # h2 every real Chrome negotiates would be its own cross-layer
+        # anomaly. The pacing argument it made is sound and unaffected either
+        # way: one request in flight per host has nothing to multiplex.
+        extra = {}
+        if self.settings.politeness.doh_url:
+            extra["doh_url"] = self.settings.politeness.doh_url
+
         self._session = AsyncSession(
             timeout=self.settings.politeness.request_timeout_s,
             impersonate=self.settings.identity.impersonate,
-            # HTTP/1.1 with keepalive. Under strict per-host politeness there is
-            # exactly one request in flight per host, so HTTP/2 multiplexing has
-            # nothing to multiplex; the value is amortizing one TLS handshake
-            # across a lease's burst of article fetches.
             allow_redirects=True,
+            **extra,
             # Redirects are followed inside curl, so they bypass per-host
             # pacing entirely. Capped well below curl's default of 30 to bound
             # what one misconfigured site can extract from us in a single get().
@@ -246,6 +519,11 @@ class PoliteFetcher:
         return self
 
     async def __aexit__(self, *exc) -> None:
+        # Before the session, and unconditionally: an orphaned Chrome on a
+        # nightly cron is a real operational failure, not a tidy-up detail.
+        if self._browser is not None:
+            await self._browser.close()
+            self._browser = None
         if self._session is not None:
             await self._session.close()
             self._session = None
@@ -265,7 +543,7 @@ class PoliteFetcher:
             return state.delay_s
         base = self.settings.politeness.default_delay_s
         if robots is not None:
-            declared = robots.crawl_delay(self.settings.identity.user_agent)
+            declared = robots.crawl_delay(self.settings.identity.robots_agent)
             if declared is not None:
                 base = max(base, declared)   # Crawl-delay is a FLOOR, never a ceiling
         state.delay_s = base
@@ -310,12 +588,13 @@ class PoliteFetcher:
         paced: bool,
         etag: str | None = None,
         last_modified: str | None = None,
+        user_agent: str | None = None,
     ) -> Response:
         assert self._session is not None, "use `async with PoliteFetcher() as f:`"
         domain = registrable_domain(url)
         state = self._host_state(domain)
 
-        headers = dict(self.settings.identity.headers())
+        headers = dict(self.settings.identity.headers(user_agent))
         # Conditional GET. Google recommends ETag over Last-Modified: a file
         # re-saved with identical content gets a new timestamp and triggers a
         # pointless refetch. Applied mostly to feeds/listings, which we re-poll
@@ -359,9 +638,17 @@ class PoliteFetcher:
                         state.blocked_until = time.monotonic() + pol.refusal_cooldown_s
                         state.blocked_reason = (
                             f"{state.consec_failures}x {type(exc).__name__}")
+                    # When our own resolver already failed for this hostname,
+                    # say so plainly. curl reports its own DNS failure as
+                    # DNSError, but a connect error against a host we never
+                    # resolved is the same fault wearing a different name, and
+                    # `failure_kind` has to be able to tell.
+                    name = type(exc).__name__
+                    if (parts.hostname or "") in self._dns_failures:
+                        name = "DNSError"
                     return Response(url=url, final_url=url, status=0, text="",
                                     headers={}, elapsed_s=time.monotonic() - started,
-                                    error=f"{type(exc).__name__}: {exc}")
+                                    error=f"{name}: {exc}")
                 elapsed = time.monotonic() - started
 
         state.observe_latency(elapsed)
@@ -391,13 +678,7 @@ class PoliteFetcher:
         pol = self.settings.politeness
 
         if resp.status in (429, 503):
-            retry_after = resp.headers.get("retry-after")
-            wait = 60.0
-            if retry_after:
-                try:
-                    wait = float(retry_after)
-                except ValueError:
-                    wait = 60.0        # HTTP-date form; 60s is a safe floor
+            wait = _retry_after_seconds(resp.headers.get("retry-after"))
             state.blocked_until = time.monotonic() + min(wait, 3600.0)
             state.blocked_reason = f"HTTP {resp.status}"
             state.delay_s = min((state.delay_s or pol.default_delay_s) * 2, 300.0)
@@ -406,6 +687,14 @@ class PoliteFetcher:
 
         if resp.status == 403 or resp.wall:
             state.consec_failures += 1
+            state.last_wall = resp.wall or state.last_wall
+            state.last_refused_status = resp.status or state.last_refused_status
+            # Slow down as well as count. The counter alone let a refusing host
+            # be re-asked at the ordinary 5s cadence four more times before the
+            # breaker opened - the same knocking the breaker exists to stop,
+            # just under the threshold. Backing off on the first refusal makes
+            # the run-up to the breaker quieter, not only shorter.
+            state.delay_s = min((state.delay_s or pol.default_delay_s) * 2, 300.0)
             # A run of refusals is a verdict, not a transient fault. Without
             # this the crawler kept asking: news.csub.edu refused fourteen
             # consecutive article fetches in one pass, each after the full
@@ -452,16 +741,62 @@ class PoliteFetcher:
         new origin and takes the same per-host lock and delay, so it is exactly
         as polite as the request it replaces.
         """
+        domain = registrable_domain(url)
         resp = await self._get_once(url, check_robots=check_robots,
-                                    etag=etag, last_modified=last_modified)
+                                    etag=etag, last_modified=last_modified,
+                                    user_agent=self._identity_for.get(domain))
         if resp.error and resp.error.startswith(_NO_SERVER_ERRORS):
             alternative = _with_www(url)
             if alternative is not None:
-                retried = await self._get_once(alternative, check_robots=check_robots,
-                                               etag=etag, last_modified=last_modified)
+                retried = await self._get_once(
+                    alternative, check_robots=check_robots, etag=etag,
+                    last_modified=last_modified,
+                    user_agent=self._identity_for.get(domain))
                 if retried.ok:
                     return retried
+            return resp
+
+        # The refusal retry. A 403 or a wall on the FIRST request is the only
+        # thing that reaches for the fallback identity, and it is tried once
+        # per host per run and then remembered, so a refusing host costs one
+        # extra request in a run rather than one per URL.
+        #
+        # Measured: holding TLS and every other header constant, defense.gov,
+        # weforum.org and michigan.gov return 403 to the bot User-Agent and
+        # 200 to a browser one, and all three publish a robots.txt that allows
+        # us. The CDN is overriding the publisher's own stated policy, so this
+        # asks the same question a second time rather than asking a different
+        # one - `From:` is still sent, robots is still evaluated against
+        # `robots_agent`, and the retry runs through `_get_once`, so it takes
+        # the circuit breaker, the robots check, the host lock and the full
+        # delay exactly like any other request.
+        if (self._should_retry_identity(resp)
+                and domain not in self._identity_for
+                and self.settings.identity.fallback_user_agent):
+            fallback = self.settings.identity.fallback_user_agent
+            retried = await self._get_once(url, check_robots=check_robots,
+                                           etag=etag, last_modified=last_modified,
+                                           user_agent=fallback)
+            if retried.ok:
+                # Sticky for the rest of the run. Per-domain data, not a
+                # per-site branch: nothing here names a site.
+                self._identity_for[domain] = fallback
+                log.debug("%s identity fallback accepted", tag(domain))
+                return retried
+            # Remember the refusal too, so the next URL on this host does not
+            # re-pay the extra request to learn the same answer.
+            self._identity_for[domain] = self.settings.identity.user_agent
         return resp
+
+    @staticmethod
+    def _should_retry_identity(resp: Response) -> bool:
+        """Only a refusal, and only one the fallback could plausibly change.
+
+        Not a timeout, not a DNS failure, not a 5xx - none of those are the
+        server declining who we are, and retrying them with a different string
+        is knocking twice for no reason.
+        """
+        return resp.status == 403 or resp.wall is not None
 
     async def _get_once(
         self,
@@ -470,6 +805,7 @@ class PoliteFetcher:
         check_robots: bool = True,
         etag: str | None = None,
         last_modified: str | None = None,
+        user_agent: str | None = None,
     ) -> Response:
         """One attempt: circuit breaker, robots, pacing, fetch."""
         domain = registrable_domain(url)
@@ -484,8 +820,40 @@ class PoliteFetcher:
 
         if check_robots:
             rules = await self.robots_for(url)
-            if not rules.allows(url, self.settings.identity.user_agent):
+            if not rules.allows(url, self.settings.identity.robots_agent):
                 return Response(url=url, final_url=url, status=0, text="", headers={},
                                 elapsed_s=0.0, error="robots-disallow")
 
-        return await self._raw_get(url, paced=True, etag=etag, last_modified=last_modified)
+        resp = await self._raw_get(url, paced=True, etag=etag,
+                                   last_modified=last_modified,
+                                   user_agent=user_agent)
+
+        # The browser tier, placed HERE rather than in `get()` so it inherits
+        # the circuit breaker and the robots check above it - the second of
+        # those absolutely must not be reachable by another route. Gated on a
+        # verdict the frontier supplied, so nothing in this file names a site.
+        from .browser import should_escalate
+
+        if self._escalate and should_escalate(
+                resp,
+                enabled=self.settings.browser_enabled,
+                challenges_enabled=self.settings.browser_challenges_enabled,
+                access=self._escalate.get(domain)):
+            rendered = await self._render(url, domain)
+            if rendered is not None and rendered.reached:
+                return rendered
+        return resp
+
+    async def _render(self, url: str, domain: str) -> "Response | None":
+        """Render one URL, under exactly the pacing an ordinary fetch takes."""
+        from .browser import BrowserFetcher
+
+        if self._browser is None:
+            self._browser = BrowserFetcher(self.settings)
+        parts = urlsplit(url)
+        origin = f"{parts.scheme}://{parts.netloc}"
+        # Same context manager `_raw_get` uses, so this cannot be less polite
+        # than the request it is replacing.
+        async with self._paced(domain, parts.hostname or "", origin):
+            return await self._browser.render(url, domain=domain)
+

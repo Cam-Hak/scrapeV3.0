@@ -1,0 +1,488 @@
+[
+  {
+    "domain": "ccu.edu",
+    "a_id": 14758,
+    "newsroom_urls": [
+      "https://www.ccu.edu/news"
+    ],
+    "discovery_method": [
+      "listing"
+    ],
+    "stored": [
+      {
+        "url": "https://ccu.edu/news/2026/world-changers-scholarship-recipients",
+        "headline": "Colorado Christian University Announces 2026 World Changers Scholarship Recipients",
+        "published_at": "2026-02-16T00:00:00",
+        "body_len": 3705
+      },
+      {
+        "url": "https://ccu.edu/news/2026/vice-president-mike-pence-to-join-ccu-as-visiting-faculty-member",
+        "headline": "Vice President Mike Pence to Join CCU as Visiting Faculty Member",
+        "published_at": "2026-08-04T00:00:00",
+        "body_len": 4043
+      },
+      {
+        "url": "https://ccu.edu/news/2026/steve-taylor-to-retire-as-dean-of-school-of-music",
+        "headline": "Steve Taylor to Retire as Dean of the School of Music",
+        "published_at": "2026-03-02T00:00:00",
+        "body_len": 2321
+      },
+      {
+        "url": "https://ccu.edu/news/2026/dr-tom-ruscica-appointed-dean-of-school-of-music",
+        "headline": "Dr. Tom Ruscica Appointed as Dean of the School of Music",
+        "published_at": "2026-07-01T00:00:00",
+        "body_len": 4631
+      },
+      {
+        "url": "https://ccu.edu/news/2026/ccu-students-design-prosthetic-hand",
+        "headline": "Colorado Christian University Engineering Undergrad Students Design Custom Prosthetic Hand for a Nine-Year-Old Girl",
+        "published_at": "2026-05-05T00:00:00",
+        "body_len": 2734
+      }
+    ]
+  },
+  {
+    "domain": "edisonohio.edu",
+    "a_id": 33408,
+    "newsroom_urls": [
+      "https://www.edisonohio.edu/News"
+    ],
+    "discovery_method": [
+      "listing"
+    ],
+    "stored": [
+      {
+        "url": "https://edisonohio.edu/news/volleyball-team-preps-2026-season",
+        "headline": "Volleyball Team Preps for 2026 Season",
+        "published_at": "2026-08-19T18:39:24",
+        "body_len": 3401
+      },
+      {
+        "url": "https://edisonohio.edu/news/three-edison-state-employees-honored-soche-awards",
+        "headline": "Three Edison State Employees Honored With SOCHE Awards",
+        "published_at": "2026-07-21T14:58:03",
+        "body_len": 4193
+      },
+      {
+        "url": "https://edisonohio.edu/news/spring-2026-deans-list-announced",
+        "headline": "Spring 2026 Dean\u2019s List Announced",
+        "published_at": "2026-07-14T17:38:11",
+        "body_len": 16494
+      },
+      {
+        "url": "https://edisonohio.edu/news/ev-cart-racing-club-hosts-4th-annual-electric-cart-race",
+        "headline": "EV Cart Racing Club Hosts 4th Annual Electric Cart Race",
+        "published_at": "2026-08-04T13:16:51",
+        "body_len": 2091
+      },
+      {
+        "url": "https://edisonohio.edu/news/edison-state-wilson-health-partner-medical-assistant-apprenticeship",
+        "headline": "Edison State, Wilson Health Partner on Medical Assistant Apprenticeship",
+        "published_at": "2026-07-16T13:30:31",
+        "body_len": 3270
+      }
+    ]
+  },
+  {
+    "domain": "emory.edu",
+    "a_id": 8128,
+    "newsroom_urls": [
+      "https://candler.emory.edu/about-candler/news"
+    ],
+    "discovery_method": [
+      "cms_api"
+    ],
+    "stored": [
+      {
+        "url": "https://candler.emory.edu/entrance-exam-a-qa-with-dean-johnson",
+        "headline": "Entrance Exam: A Q&A with Dean Johnson",
+        "published_at": "2026-08-06T14:56:40",
+        "body_len": 3525
+      },
+      {
+        "url": "https://candler.emory.edu/candler-to-host-brotherhood-film-screening-sept-14",
+        "headline": "Candler to Host \u2018Brotherhood\u2019 Film Screening Sept. 14",
+        "published_at": "2026-08-06T13:36:16",
+        "body_len": 1020
+      },
+      {
+        "url": "https://candler.emory.edu/dean-installation-events-to-center-candlers-intellectual-prophetic-call",
+        "headline": "Dean Installation Events to Center Candler\u2019s Intellectual, Prophetic Call",
+        "published_at": "2026-08-05T23:30:57",
+        "body_len": 4717
+      },
+      {
+        "url": "https://candler.emory.edu/september-events-to-explore-queer-history-memory-and-the-umc",
+        "headline": "September Events to Explore Queer History, Memory, and the UMC",
+        "published_at": "2026-08-05T17:19:00",
+        "body_len": 5675
+      },
+      {
+        "url": "https://candler.emory.edu/deans-opening-letter-highlights-listening-learning",
+        "headline": "Dean\u2019s Opening Letter Highlights Listening, Learning",
+        "published_at": "2026-08-03T19:30:29",
+        "body_len": 2671
+      },
+      {
+        "url": "https://candler.emory.edu/new-faculty-join-candlers-ranks",
+        "headline": "New Faculty Join Candler\u2019s Ranks",
+        "published_at": "2026-08-03T18:36:11",
+        "body_len": 2147
+      }
+    ]
+  },
+  {
+    "domain": "fightcancer.org",
+    "a_id": 22385,
+    "newsroom_urls": [
+      "https://www.fightcancer.org/press-room/search"
+    ],
+    "discovery_method": [
+      "listing"
+    ],
+    "stored": [
+      {
+        "url": "https://www.fightcancer.org/actions/its-time-expand-medicaid-florida",
+        "headline": "It's Time To Expand Medicaid in Florida.",
+        "published_at": "2026-08-10T17:18:49",
+        "body_len": 1173
+      },
+      {
+        "url": "https://www.fightcancer.org/minnesota-cancer-votes-campaign-hub",
+        "headline": "Minnesota Cancer Votes Campaign Hub",
+        "published_at": "2026-07-28T15:35:40",
+        "body_len": 945
+      },
+      {
+        "url": "https://www.fightcancer.org/actions/its-time-expand-medicaid-florida",
+        "headline": "It's Time To Expand Medicaid in Florida.",
+        "published_at": "2026-08-10T17:18:49",
+        "body_len": 1173
+      },
+      {
+        "url": "https://www.fightcancer.org/minnesota-cancer-votes-campaign-hub",
+        "headline": "Minnesota Cancer Votes Campaign Hub",
+        "published_at": "2026-07-28T15:35:40",
+        "body_len": 945
+      },
+      {
+        "url": "https://www.fightcancer.org/actions/its-time-expand-medicaid-florida",
+        "headline": "It's Time To Expand Medicaid in Florida.",
+        "published_at": "2026-08-10T17:18:49",
+        "body_len": 1173
+      },
+      {
+        "url": "https://www.fightcancer.org/minnesota-cancer-votes-campaign-hub",
+        "headline": "Minnesota Cancer Votes Campaign Hub",
+        "published_at": "2026-07-28T15:35:40",
+        "body_len": 945
+      }
+    ]
+  },
+  {
+    "domain": "hacu.net",
+    "a_id": 24976,
+    "newsroom_urls": [
+      "https://hacu.net/category/news"
+    ],
+    "discovery_method": [
+      null
+    ],
+    "stored": [
+      {
+        "url": "https://hacu.net/hacu-accepting-applications-for-career-readiness-program",
+        "headline": "HACU accepting applications for its Career Readiness Program",
+        "published_at": "2026-08-24T19:04:28",
+        "body_len": 969
+      },
+      {
+        "url": "https://hacu.net/hacu-launches-president-and-ceo-search-following-retirement-announcement-of-antonio-r-flores",
+        "headline": "HACU launches President and CEO search following retirement announcement of Antonio R. Flores",
+        "published_at": "2026-08-21T21:33:12",
+        "body_len": 1354
+      },
+      {
+        "url": "https://hacu.net/hacu-accepting-applications-for-student-research-poster-competition",
+        "headline": "HACU accepting applications for student research poster competition",
+        "published_at": "2026-08-21T21:05:36",
+        "body_len": 1406
+      },
+      {
+        "url": "https://hacu.net/hacu-accepting-teaching-spanish-and-spanish-literature-scholarship",
+        "headline": "HACU accepting Teaching Spanish and Spanish Literature Scholarship",
+        "published_at": "2026-08-21T19:33:47",
+        "body_len": 1408
+      }
+    ]
+  },
+  {
+    "domain": "hccs.edu",
+    "a_id": 21800,
+    "newsroom_urls": [
+      "https://www.hccs.edu/news"
+    ],
+    "discovery_method": [
+      "sitemap"
+    ],
+    "stored": [
+      {
+        "url": "https://hccs.edu/news/2026/august/hcc-multimedia-journalism-initiative-wins-two-key-grants",
+        "headline": "HCC multimedia journalism initiative wins two key grants",
+        "published_at": "2026-08-24T16:10:20",
+        "body_len": 2450
+      },
+      {
+        "url": "https://hccs.edu/news/2026/april/us-economic-future-depends-on-rethinking-the-future-of-work",
+        "headline": "U.S. economic future depends on rethinking the future of work",
+        "published_at": "2026-08-24T13:31:19",
+        "body_len": 5260
+      },
+      {
+        "url": "https://hccs.edu/news/2026/may/hcc-baccalaureate-student-adam-blank-uses-ai-to-bring-transparency-to-healthcare-costs",
+        "headline": "HCC Baccalaureate student Adam Blank uses AI to bring transparency to healthcare costs",
+        "published_at": "2026-08-24T13:30:51",
+        "body_len": 3609
+      },
+      {
+        "url": "https://hccs.edu/news/2026/march/houston-city-college-symposium-on-april-1-centers-on-next-gen-ai-innovation",
+        "headline": "Houston City College symposium on April 1 centers on next-gen AI innovation",
+        "published_at": "2026-08-24T13:30:23",
+        "body_len": 1574
+      },
+      {
+        "url": "https://hccs.edu/news/2025/december/houston-city-college-announces-2-million-in-funding-from-google-to-expand-ai-training-across-region",
+        "headline": "Houston City College announces $2 million in funding from Google to expand AI training across region",
+        "published_at": "2026-08-24T13:29:38",
+        "body_len": 3094
+      },
+      {
+        "url": "https://hccs.edu/news/2026/august/fixing-machines-and-saving-lives--hcc-biomedical-electronics-program-powers-careers-in-health-care",
+        "headline": "Fixing Machines and Saving Lives:  HCC Biomedical Electronics Program Powers Careers in Health Care",
+        "published_at": "2026-08-18T11:41:04",
+        "body_len": 4461
+      }
+    ]
+  },
+  {
+    "domain": "house.gov",
+    "a_id": 27599,
+    "newsroom_urls": [
+      "https://clayhiggins.house.gov/category/media/press-releases"
+    ],
+    "discovery_method": [
+      "cms_api"
+    ],
+    "stored": [
+      {
+        "url": "https://clayhiggins.house.gov/2026/08/18/higgins-urges-president-trump-to-direct-army-corps-action-on-the-vermilion-river-in-conjunction-with-ul-lafayette-renews-call-for-civil-works-reform",
+        "headline": "Higgins Urges President Trump to Direct Army Corps Action on the Vermilion River in Conjunction with UL-Lafayette, Renews Call for Civil Works Reform",
+        "published_at": "2026-08-18T21:44:05",
+        "body_len": 3051
+      },
+      {
+        "url": "https://clayhiggins.house.gov/2026/08/07/higgins-qualifies-for-reelection-to-u-s-house-pledges-to-continue-to-deliver-for-louisiana",
+        "headline": "Higgins Qualifies for Reelection to U.S. House, Pledges to Continue to Deliver for Louisiana",
+        "published_at": "2026-08-07T15:10:05",
+        "body_len": 1260
+      }
+    ]
+  },
+  {
+    "domain": "house.gov",
+    "a_id": 35568,
+    "newsroom_urls": [
+      "https://owens.house.gov/resources/press"
+    ],
+    "discovery_method": [
+      "rss"
+    ],
+    "stored": [
+      {
+        "url": "https://owens.house.gov/posts/owens-applauds-education-departments-approval-of-the-nations-first-workforce-pell-grant-program",
+        "headline": "OWENS APPLAUDS EDUCATION DEPARTMENT\u2019S APPROVAL OF THE NATION\u2019S FIRST WORKFORCE PELL GRANT PROGRAM",
+        "published_at": "2026-08-05T19:40:50",
+        "body_len": 1608
+      }
+    ]
+  },
+  {
+    "domain": "lung.org",
+    "a_id": 17116,
+    "newsroom_urls": [
+      "https://www.lung.org/media/press-releases"
+    ],
+    "discovery_method": [
+      null
+    ],
+    "stored": [
+      {
+        "url": "https://lung.org/media/press-releases/fy27-clinical-trials-policy",
+        "headline": "Public Health Organizations Urge HHS to Remove Financial Barriers in Clinical Trial Participation",
+        "published_at": "2026-08-04T00:00:00",
+        "body_len": 7095
+      },
+      {
+        "url": "https://lung.org/media/press-releases/measles-risks-vaccines-school-2026",
+        "headline": "American Lung Association Encourages Parents to Talk to Healthcare Providers About Measles Risks and Recommended Vaccines as Part of Back-to-School Prep",
+        "published_at": "2026-08-04T00:00:00",
+        "body_len": 2566
+      }
+    ]
+  },
+  {
+    "domain": "sustainableagriculture.net",
+    "a_id": 29505,
+    "newsroom_urls": [
+      "https://sustainableagriculture.net/press"
+    ],
+    "discovery_method": [
+      "cms_api"
+    ],
+    "stored": [
+      {
+        "url": "https://sustainableagriculture.net/blog/the-senate-farm-bill-markup-what-happened-and-whats-next",
+        "headline": "The Senate Farm Bill Markup: What Happened and What\u2019s Next",
+        "published_at": "2026-08-24T21:05:40",
+        "body_len": 5911
+      },
+      {
+        "url": "https://sustainableagriculture.net/blog/comment-senate-farm-bill-takes-a-step-forward-significant-work-remains",
+        "headline": "Comment: Senate Farm Bill Takes A Step Forward, Significant Work Remains",
+        "published_at": "2026-08-06T17:54:34",
+        "body_len": 1919
+      },
+      {
+        "url": "https://sustainableagriculture.net/blog/comment-revised-senate-farm-bill-proposal-still-falls-flat-for-most-farmers",
+        "headline": "Comment: Revised Senate Farm Bill Proposal Still Falls Flat for Most Farmers",
+        "published_at": "2026-08-02T20:14:07",
+        "body_len": 2376
+      },
+      {
+        "url": "https://sustainableagriculture.net/blog/ozark-food-systems-and-farm-bill-strategy-nsacs-summer-meeting-recap",
+        "headline": "Ozark Food Systems and Farm Bill Strategy: NSAC\u2019s Summer Meeting Recap",
+        "published_at": "2026-08-26T20:57:20",
+        "body_len": 10164
+      }
+    ]
+  },
+  {
+    "domain": "ufw.org",
+    "a_id": 19517,
+    "newsroom_urls": [
+      "https://ufw.org/news-and-events/press-releases"
+    ],
+    "discovery_method": [
+      "listing"
+    ],
+    "stored": [
+      {
+        "url": "https://ufw.org/u-s-federal-court-rules-trump-administrations-bid-to-cut-farm-worker-wages-is-illegal",
+        "headline": "U.S. Federal Court rules Trump Administration\u2019s bid to cut farm worker wages is illegal",
+        "published_at": "2026-08-26T22:07:52",
+        "body_len": 3372
+      },
+      {
+        "url": "https://ufw.org/university-of-washington-a-history-of-farm-labor-organizing-1890-2009",
+        "headline": "University of Washington: A History of Farm Labor Organizing 1890-2009",
+        "published_at": "2026-08-12T04:41:59",
+        "body_len": 2492
+      },
+      {
+        "url": "https://ufw.org/u-s-federal-court-rules-trump-administrations-bid-to-cut-farm-worker-wages-is-illegal",
+        "headline": "U.S. Federal Court rules Trump Administration\u2019s bid to cut farm worker wages is illegal",
+        "published_at": "2026-08-26T22:07:52",
+        "body_len": 3372
+      },
+      {
+        "url": "https://ufw.org/governments-own-records-reveal-racial-profiling-in-federal-immigration-stops",
+        "headline": "Government\u2019s Own Records Reveal Racial Profiling in Federal Immigration Stops",
+        "published_at": "2026-07-28T18:33:05",
+        "body_len": 5502
+      },
+      {
+        "url": "https://ufw.org/community-members-and-civil-rights-advocates-to-host-rally-before-court-hearing-on-unlawful-immigration-arrests",
+        "headline": "Community Members and Civil Rights Advocates to Host Rally Before Court Hearing on Unlawful Immigration Arrests",
+        "published_at": "2026-08-11T19:40:05",
+        "body_len": 3016
+      },
+      {
+        "url": "https://ufw.org/u-s-federal-court-rules-trump-administrations-bid-to-cut-farm-worker-wages-is-illegal",
+        "headline": "U.S. Federal Court rules Trump Administration\u2019s bid to cut farm worker wages is illegal",
+        "published_at": "2026-08-26T22:07:52",
+        "body_len": 3372
+      }
+    ]
+  },
+  {
+    "domain": "usc.edu",
+    "a_id": 35913,
+    "newsroom_urls": [
+      "https://gould.usc.edu/about/news"
+    ],
+    "discovery_method": [
+      null
+    ],
+    "stored": [
+      {
+        "url": "https://gould.usc.edu/news/the-eyes-of-e-blake-hazard",
+        "headline": "The Eyes of E. Blake Hazard",
+        "published_at": "2025-08-05T00:00:00",
+        "body_len": 9125
+      },
+      {
+        "url": "https://gould.usc.edu/news/student-helps-small-business-take-a-step-in-the-right-direction",
+        "headline": "Student helps small business take a step in the right direction",
+        "published_at": "2026-01-08T00:00:00",
+        "body_len": 3187
+      },
+      {
+        "url": "https://gould.usc.edu/news/research-spotlight-when-ai-takes-the-wheel-whos-responsible",
+        "headline": "Research Spotlight: When AI takes the wheel, who\u2019s responsible?",
+        "published_at": "2026-01-15T00:00:00",
+        "body_len": 7088
+      }
+    ]
+  },
+  {
+    "domain": "uta.edu",
+    "a_id": 8148,
+    "newsroom_urls": [
+      "https://www.uta.edu/news/news-releases"
+    ],
+    "discovery_method": [
+      "listing"
+    ],
+    "stored": [
+      {
+        "url": "https://www.uta.edu/news/news-releases/2026/08/26/uta-student-explores-heart-research-in-chicago",
+        "headline": "UTA student explores heart research in Chicago",
+        "published_at": "2026-08-26T00:00:00",
+        "body_len": 3414
+      },
+      {
+        "url": "https://www.uta.edu/news/news-releases/2026/08/25/from-military-service-to-student-success-at-uta",
+        "headline": "From military service to student success at UTA",
+        "published_at": "2026-08-25T00:00:00",
+        "body_len": 3982
+      },
+      {
+        "url": "https://www.uta.edu/news/news-releases/2026/08/24/uta-researcher-could-improve-autonomous-vehicle-systems",
+        "headline": "UTA research could improve autonomous vehicle systems",
+        "published_at": "2026-08-24T00:00:00",
+        "body_len": 3680
+      },
+      {
+        "url": "https://www.uta.edu/news/news-releases/2026/08/24/uta-planetarium-gets-ready-for-romans-big-launch",
+        "headline": "UTA Planetarium gets ready for Roman\u2019s big launch",
+        "published_at": "2026-08-24T00:00:00",
+        "body_len": 2898
+      },
+      {
+        "url": "https://www.uta.edu/news/news-releases/2026/08/24/uc-transformation-reimagines-utas-living-room",
+        "headline": "UC transformation reimagines UTA\u2019s \u2018living room\u2019",
+        "published_at": "2026-08-24T00:00:00",
+        "body_len": 7711
+      }
+    ]
+  }
+]

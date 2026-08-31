@@ -250,6 +250,73 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         table.add_row("Ollama", "[dim]not running[/dim]",
                       "Only needed from Phase 5 (wrapper induction)")
 
+    # A resolver that cannot answer for a whole TLD is invisible everywhere
+    # else: every target under it fails at status 0, and the website reports
+    # those publishers as broken. 20 .mil targets sat that way through a full
+    # corpus run. Two seconds here would have named it.
+    import socket
+
+    probes = ("www.centcom.mil", "www.defense.gov", "www.usda.gov")
+    unresolved = []
+    for host in probes:
+        try:
+            socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+        except Exception:                                   # noqa: BLE001
+            unresolved.append(host)
+    if not unresolved:
+        table.add_row("DNS", "[green]ok[/green]",
+                      f"system resolver answered for all {len(probes)} probes")
+    elif settings.politeness.doh_url:
+        table.add_row("DNS", "[yellow]system resolver failing[/yellow]",
+                      f"cannot resolve {', '.join(unresolved)} - "
+                      f"working around it with DoH ({settings.politeness.doh_url})")
+    else:
+        ok = False
+        table.add_row("DNS", "[red]broken[/red]",
+                      f"cannot resolve {', '.join(unresolved)}. These hosts are "
+                      "fine - your resolver is not. Fix the host's DNS, or set "
+                      "SCRAPEV3_DOH_URL=https://cloudflare-dns.com/dns-query")
+
+    # A capability that is quietly absent is the failure mode this project
+    # exists to eliminate, so `doctor` answers it before a run does.
+    if settings.browser_enabled:
+        try:
+            import nodriver           # noqa: F401
+            table.add_row("Browser", "[green]ok[/green]",
+                          "nodriver present; challenges "
+                          + ("on" if settings.browser_challenges_enabled else "off"))
+        except ImportError:
+            ok = False
+            table.add_row("Browser", "[red]missing[/red]",
+                          "SCRAPEV3_BROWSER=on but nodriver is not installed - "
+                          "pip install -e .[browser]")
+    else:
+        table.add_row("Browser", "[dim]off[/dim]",
+                      "SCRAPEV3_BROWSER=on to render JS newsrooms")
+
+    # "Re-pinned quarterly" was a comment while the pin sat 26 releases back.
+    try:
+        from curl_cffi.requests import BrowserType
+
+        available = {b.value for b in BrowserType}
+        pinned = settings.identity.impersonate
+        if pinned not in available:
+            ok = False
+            table.add_row("Impersonation", "[red]unsupported[/red]",
+                          f"{pinned} is not in this curl_cffi build")
+        else:
+            newest = max((int(b[len("chrome"):]) for b in available
+                          if b.startswith("chrome") and b[len("chrome"):].isdigit()),
+                         default=0)
+            n = int(pinned[6:]) if pinned.startswith("chrome") and pinned[6:].isdigit() else newest
+            stale = newest - n > 12
+            table.add_row("Impersonation",
+                          "[yellow]stale[/yellow]" if stale else "[green]ok[/green]",
+                          f"{pinned}" + (f" - newest available is chrome{newest}"
+                                         if stale else ""))
+    except Exception:                                       # noqa: BLE001
+        pass
+
     console.print(table)
     return 0 if ok else 1
 

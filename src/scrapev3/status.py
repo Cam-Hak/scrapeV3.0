@@ -71,7 +71,24 @@ _SEVERITY = {
     "empty": "warn",
     "never": "error",
     "failing": "error",
+    # A publisher's CDN declining an identified crawler is a real fault to
+    # show, but it is THEIR decision and not a defect on our side - warn, not
+    # error. `unresolved` is the opposite: our own resolver, our own problem,
+    # and it hid 20 .mil agencies behind a false "site is failing".
+    "refused": "warn",
+    "unresolved": "error",
 }
+
+
+def _worse_access(current: str | None, incoming: str | None) -> str | None:
+    """Fold an agency's targets worst-first, like `needs_browser` is OR-ed.
+
+    A refusal outranks a challenge because it is the harder verdict: a
+    challenge might be solvable, a refusal is the publisher saying no.
+    """
+    order = {None: 0, "js_rendered": 1, "unresolved": 2, "challenge": 3,
+             "refused": 4}
+    return current if order.get(current, 0) >= order.get(incoming, 0) else incoming
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS agency_status (
@@ -103,6 +120,7 @@ CREATE TABLE IF NOT EXISTS agency_status (
   last_stored_at    DATETIME NULL,
   tns_loaded        INT NOT NULL DEFAULT 0,
   tns_pending       INT NOT NULL DEFAULT 0,
+  access            VARCHAR(16) NULL,
   updated_at        DATETIME NOT NULL,
   PRIMARY KEY (a_id),
   KEY idx_status_severity (severity),
@@ -132,6 +150,7 @@ _MIGRATIONS = (
     ("last_stored_at", "DATETIME NULL"),
     ("tns_loaded", "INT NOT NULL DEFAULT 0"),
     ("tns_pending", "INT NOT NULL DEFAULT 0"),
+    ("access", "VARCHAR(16) NULL"),
 )
 
 # Written and read by name, never by position: the website selects columns
@@ -147,6 +166,9 @@ COLUMNS = (
     "targets_cached", "feed_url", "feed_absent", "probed_at", "conditional_get",
     "next_due_at", "crawl_delay_s", "revisit_period_s", "first_stored_at",
     "last_stored_at", "tns_loaded", "tns_pending",
+    # Which kind of refusal, when there was one. Appended after the first
+    # deployment, so it is in `_MIGRATIONS` too.
+    "access",
     "updated_at",
 )
 
@@ -192,6 +214,7 @@ class AgencyStatus:
     last_stored_at: datetime | None = None
     tns_loaded: int = 0
     tns_pending: int = 0
+    access: str | None = None
 
     updated_at: datetime | None = None
 
@@ -220,6 +243,7 @@ class AgencyStatus:
 # ---------------------------------------------------------------------------
 
 def classify(*, enabled: bool, consec_failures: int, needs_browser: bool,
+             access: str | None = None,
              last_success_at: datetime | None, last_article_at: datetime | None,
              articles: int, now: datetime) -> tuple[str, str]:
     """Health and the sentence explaining it.
@@ -238,9 +262,17 @@ def classify(*, enabled: bool, consec_failures: int, needs_browser: bool,
         return "never", ("never crawled successfully" if consec_failures == 0
                          else "never crawled successfully, "
                               + _plural(consec_failures, "attempt") + " failed")
+    # Ahead of the failure counter deliberately. A refusing host still racks up
+    # consecutive failures, so scoring that first reported "3 crawls in a row
+    # failed" - true, and a statement about the publisher's reliability rather
+    # than about a decision their CDN made on purpose.
+    if access == "refused":
+        return "refused", "the publisher's CDN is declining an identified crawler"
+    if access == "unresolved":
+        return "unresolved", "our resolver cannot resolve this host"
     if consec_failures >= FAILING_AFTER:
         return "failing", f"{_plural(consec_failures, 'crawl')} in a row failed"
-    if needs_browser:
+    if needs_browser or access in ("challenge", "js_rendered"):
         return "blocked", "the page needs a browser to render its articles"
 
     success_age = (now - last_success_at).days
@@ -293,7 +325,7 @@ def compose(frontier: "Frontier", sink: "Sink", *,
     merged: dict[int, AgencyStatus] = {}
     for row in frontier.status_rows():
         (a_id, domain, newsroom_url, enabled, method, last_success,
-         failures, p50, needs_browser,
+         failures, p50, needs_browser, access,
          feed_url, feed_absent, probed_at, etag, last_modified,
          next_due, crawl_delay, revisit) = row
         a_id = int(a_id)
@@ -308,6 +340,7 @@ def compose(frontier: "Frontier", sink: "Sink", *,
                 enabled=bool(enabled), discovery_method=method,
                 consec_failures=int(failures or 0),
                 needs_browser=bool(needs_browser),
+                access=access or None,
                 median_body_len=int(p50) if p50 is not None else None,
                 last_success_at=last_success,
                 targets_cached=1 if method else 0,
@@ -323,6 +356,7 @@ def compose(frontier: "Frontier", sink: "Sink", *,
         current.targets_cached += 1 if method else 0
         current.enabled = current.enabled or bool(enabled)
         current.needs_browser = current.needs_browser or bool(needs_browser)
+        current.access = _worse_access(current.access, access)
         current.consec_failures = max(current.consec_failures, int(failures or 0))
 
         # The soonest of the agency's domains, because that is when it next
@@ -381,6 +415,7 @@ def compose(frontier: "Frontier", sink: "Sink", *,
             enabled=status.enabled,
             consec_failures=status.consec_failures,
             needs_browser=status.needs_browser,
+            access=status.access,
             last_success_at=status.last_success_at,
             last_article_at=status.last_article_at,
             articles=status.articles,

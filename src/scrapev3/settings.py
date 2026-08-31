@@ -47,30 +47,100 @@ def load_dotenv(path: str | Path = ".env") -> None:
 
 @dataclass(frozen=True)
 class Identity:
-    """How we present ourselves. Honest at the application layer.
+    """How we present ourselves. Honest first, and identifiable throughout.
 
-    The plan's posture: modern/non-anomalous at the transport layer (curl_cffi
-    fingerprint) but truthful about who we are at the application layer. Do not
-    pair a browser User-Agent with this - vendors run cross-layer consistency
-    checks, and a Chrome JA4 with a bot UA is itself an anomaly signal.
+    Modern/non-anomalous at the transport layer (curl_cffi fingerprint),
+    truthful about who we are at the application layer. We send the bot
+    User-Agent on every first request and it stays the default everywhere.
+
+    **What was measured, and why `fallback_user_agent` exists.** 55 of 1,747
+    audited targets returned 403. Holding TLS and every other header fixed and
+    changing only the User-Agent:
+
+        chrome131 TLS + TNSNewsBot UA   -> 403   defense.gov, weforum.org,
+        chrome131 TLS + Chrome UA       -> 200   michigan.gov
+
+    Appending our token to a browser string (`Chrome/131... TNSNewsBot/1.0`)
+    also returns 403 on all three, so these WAFs match on the presence of a
+    bot token rather than on behaviour. And robots.txt on every one of them
+    returns `can_fetch = True` for us, with no Crawl-delay: the publisher's
+    own stated policy permits the crawl and a CDN default overrides it.
+
+    So the fallback is used **only after a refusal**, never first, and
+    `From:` is sent either way - a publisher can still see who we are and
+    reach us. `robots_agent` keeps robots.txt evaluated against our own token
+    no matter what we send, so the rules we obey never loosen with the string
+    we present. That ordering also keeps Cloudflare's Verified Bot programme
+    reachable, which `fetch/robots.py` is written against: it needs a stable
+    identifiable UA, and a crawler that leads with Chrome everywhere forfeits
+    it permanently.
     """
 
     user_agent: str = field(default_factory=lambda: _env(
         "USER_AGENT", "TNSNewsBot/1.0 (+https://targetednews.com/bot)"))
+    # Tried once, per host, only after a 403 or a wall. Empty disables it.
+    fallback_user_agent: str = field(default_factory=lambda: _env(
+        "FALLBACK_USER_AGENT",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"))
+    # What robots.txt is matched against - ALWAYS our own token, whatever we
+    # send. Presenting a browser string must never widen what we are allowed
+    # to fetch, and `Protego.can_fetch` keys entirely on this value.
+    robots_agent: str = field(default_factory=lambda: _env(
+        "ROBOTS_AGENT", "TNSNewsBot"))
     contact_email: str = field(default_factory=lambda: _env(
         "CONTACT_EMAIL", "crawler@targetednews.com"))
     # curl_cffi impersonation target. Pinned, and re-pinned quarterly:
     # impersonating a Chrome version long out of support is its own signal.
-    impersonate: str = field(default_factory=lambda: _env("IMPERSONATE", "chrome124"))
+    # `doctor` checks this against the installed curl_cffi, because "re-pinned
+    # quarterly" was a comment for two years and the pin sat 26 releases back.
+    impersonate: str = field(default_factory=lambda: _env("IMPERSONATE", "chrome146"))
 
-    def headers(self) -> dict[str, str]:
+    def headers(self, user_agent: str | None = None) -> dict[str, str]:
         return {
-            "User-Agent": self.user_agent,
+            "User-Agent": user_agent or self.user_agent,
+            # Sent on every request, including fallback ones. RFC 9110's
+            # header for exactly this: whoever is looking at their logs can
+            # find out who we are and tell us to stop.
             "From": self.contact_email,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br",
         }
+
+
+@dataclass(frozen=True)
+class Browser:
+    """The optional browser transport. Off by default, and narrow on purpose.
+
+    Read the addressable set honestly before turning this on. Of 41 walls in
+    the first corpus run, 30 were "access denied" - a flat refusal that renders
+    exactly the same in Chrome - leaving at most ~11 real interstitials, and an
+    honestly-identified browser will not clear most Cloudflare challenges
+    either. The defensible payoff is `js_rendered` newsrooms: sites that render
+    with JavaScript and have never challenged anyone. That is a rendering
+    problem, not an access problem, and no stance is at stake.
+
+    So `challenges` is a SEPARATE switch from `enabled`, and defaults off. A
+    challenge page is a site declining an identified crawler, and pointing a
+    browser at it is a decision that should be explicit and dated rather than
+    inherited from a default.
+    """
+
+    enabled: str = field(default_factory=lambda: _env("BROWSER", "off").strip().lower())
+    challenges: str = field(default_factory=lambda: _env(
+        "BROWSER_CHALLENGES", "off").strip().lower())
+    # Renders in flight process-wide, ON TOP OF the per-host lock and the IP
+    # cap. A render costs seconds and hundreds of MB; 1 is the honest default.
+    concurrency: int = field(default_factory=lambda: _env_i("BROWSER_CONCURRENCY", 1))
+    # Per pass. A bad night must not turn into a browser storm.
+    max_pages: int = field(default_factory=lambda: _env_i("BROWSER_MAX_PAGES", 50))
+    # Longer than request_timeout_s, because rendering legitimately takes
+    # longer than fetching - but hard, and enforced by wait_for.
+    timeout_s: float = field(default_factory=lambda: _env_f("BROWSER_TIMEOUT_S", 25))
+    # Chrome leaks. Recycling is cheap and standard.
+    recycle_pages: int = field(default_factory=lambda: _env_i("BROWSER_RECYCLE_PAGES", 25))
+    executable: str = field(default_factory=lambda: _env("BROWSER_PATH", "").strip())
 
 
 @dataclass(frozen=True)
@@ -96,6 +166,22 @@ class Politeness:
     global_concurrency: int = field(default_factory=lambda: _env_i("GLOBAL_CONCURRENCY", 32))
     request_timeout_s: float = field(default_factory=lambda: _env_f("REQUEST_TIMEOUT_S", 20))
     dns_timeout_s: float = field(default_factory=lambda: _env_f("DNS_TIMEOUT_S", 3))
+    # Resolve over DNS-over-HTTPS instead of the system resolver. Empty = system.
+    #
+    # Not a circumvention of anything: a resolver that answers `getaddrinfo
+    # failed` for www.centcom.mil while 1.1.1.1 answers instantly is OUR fault,
+    # and the 20 .mil targets it silenced were published to those agencies'
+    # rows as their sites failing. Measured: with DoH set, centcom.mil returns
+    # 200 and 277KB of press releases.
+    #
+    # DoH rather than CURLOPT_DNS_SERVERS because that option needs a libcurl
+    # built against c-ares, and the wheel curl_cffi ships is not - it fails
+    # with "Failed to setopt 10211". DoH is a plain HTTPS request to a public
+    # resolver and needs no such build.
+    #
+    # Fix the host's resolver first; this is the escape hatch for when you
+    # cannot. Production should run under WSL2 anyway.
+    doh_url: str = field(default_factory=lambda: _env("DOH_URL", "").strip())
     # Latency-adaptive backoff: if a host's current latency exceeds this
     # multiple of its rolling p50, double the delay even on HTTP 200.
     latency_backoff_multiple: float = field(default_factory=lambda: _env_f("LATENCY_BACKOFF_MULTIPLE", 2.0))
@@ -183,6 +269,7 @@ class Tns:
 class Settings:
     identity: Identity = field(default_factory=Identity)
     politeness: Politeness = field(default_factory=Politeness)
+    browser: Browser = field(default_factory=Browser)
     ollama: Ollama = field(default_factory=Ollama)
     mysql: MySQL = field(default_factory=MySQL)
     tns: Tns = field(default_factory=Tns)
@@ -219,6 +306,14 @@ class Settings:
     @property
     def requests_enabled(self) -> bool:
         return self.requests in {"on", "true", "1", "yes"}
+
+    @property
+    def browser_enabled(self) -> bool:
+        return self.browser.enabled in {"on", "true", "1", "yes"}
+
+    @property
+    def browser_challenges_enabled(self) -> bool:
+        return self.browser.challenges in {"on", "true", "1", "yes"}
 
     @classmethod
     def load(cls, dotenv: str | Path = ".env") -> "Settings":

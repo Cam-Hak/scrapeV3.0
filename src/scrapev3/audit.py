@@ -33,7 +33,7 @@ from urllib.parse import urljoin, urlsplit
 from selectolax.lexbor import LexborHTMLParser
 
 from .discover.sources import discover
-from .fetch import PoliteFetcher
+from .fetch import PoliteFetcher, failure_kind
 from .urls import canonical_url, classify_url, is_non_news_path, registrable_domain
 
 # A result set whose links appear nowhere on the target page is the
@@ -94,6 +94,15 @@ class TargetAudit:
     body_chars: int = 0
     usable: bool = False
     extract_note: str | None = None
+
+    # Why an unreachable target was unreachable, as one word from
+    # `fetch.failure_kind`. Without it `status = 0` covers a broken local
+    # resolver, an open circuit breaker and a robots refusal alike, and the
+    # first full corpus run reported 67 such targets with the reason discarded
+    # - 20 of them `.mil` hosts that resolve fine from any other resolver.
+    # Stored so `audit --rescore` can re-bucket saved evidence without
+    # spending a single request to re-learn it.
+    unreachable_kind: str = ""
 
     findings: list[Finding] = field(default_factory=list)
     sample: list[str] = field(default_factory=list)
@@ -174,7 +183,27 @@ def judge(a: TargetAudit) -> None:
     """Turn the measurements into named findings. Every rule states its number,
     so a flag can be argued with rather than just believed."""
     if not a.reachable:
-        a.findings.append(Finding("unreachable", f"newsroom page returned {a.status}", 3))
+        # Not every unreachable target is the publisher's doing, and scoring
+        # them alike put our own faults on their row. `robots` is the rule
+        # working as designed and is not a finding at all - the crawler makes
+        # the same argument for `robots_disallowed`. `dns` and `circuit` are
+        # ours: a resolver that cannot answer for a host any other resolver
+        # answers for instantly is not evidence about the site, and neither is
+        # a breaker we opened ourselves.
+        if a.unreachable_kind == "robots":
+            a.notes.append("robots.txt disallows this newsroom URL")
+            return
+        if a.unreachable_kind in ("dns", "circuit"):
+            a.findings.append(Finding(
+                a.unreachable_kind,
+                "our resolver could not resolve this host"
+                if a.unreachable_kind == "dns" else
+                "we stopped asking before the site answered", 1))
+            return
+        detail = f"newsroom page returned {a.status}"
+        if a.unreachable_kind and a.unreachable_kind != "http_4xx":
+            detail += f" ({a.unreachable_kind})"
+        a.findings.append(Finding("unreachable", detail, 3))
         return
 
     if a.n_articles == 0:
@@ -254,6 +283,7 @@ async def audit_target(fetcher: PoliteFetcher, *, a_id: int, domain: str,
     resp = await fetcher.get(newsroom_url)
     a.status = resp.status
     a.reachable = bool(resp.ok)
+    a.unreachable_kind = "" if resp.ok else failure_kind(resp)
     links: set[str] = set()
     if resp.ok:
         try:
@@ -263,6 +293,15 @@ async def audit_target(fetcher: PoliteFetcher, *, a_id: int, domain: str,
             a.errors.append(f"page parse failed: {type(exc).__name__}")
     elif resp.wall:
         a.errors.append(f"bot wall: {resp.wall}")
+    # Everything else that failed. There was no branch here at all, so a
+    # target that failed for any reason OTHER than a bot wall recorded
+    # nothing: `resp.error` carries "DNSError: ...", "robots-disallow" and
+    # "circuit-open: host backing off after 5x ...", and all three were
+    # dropped on the floor. That is why the first corpus run showed 149
+    # unreachable targets and only 41 carrying an explanation - the other 108
+    # were not unexplained, the explanation was discarded here.
+    elif resp.error:
+        a.errors.append(resp.error)
     a.n_page_links = len(links)
 
     if not a.reachable:

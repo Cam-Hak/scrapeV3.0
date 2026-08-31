@@ -43,7 +43,8 @@ _COLUMNS = (
     "domain", "a_id", "newsroom_url", "shard", "enabled", "next_allowed_at",
     "leased_until", "lease_owner", "crawl_delay_s", "revisit_period_s",
     "consec_failures", "discovery_method", "feed_url", "etag", "last_modified",
-    "needs_browser", "needs_browser_at", "last_success_at", "p50_body_len",
+    "needs_browser", "needs_browser_at", "access", "last_success_at",
+    "p50_body_len",
 )
 _COLUMN_LIST = ", ".join(_COLUMNS)
 
@@ -94,6 +95,7 @@ def _to_record(row: Sequence[Any]) -> DomainRecord:
         last_modified=d["last_modified"],
         needs_browser=bool(d["needs_browser"]),
         needs_browser_at=from_ts(d["needs_browser_at"]),
+        access=d["access"],
         last_success_at=from_ts(d["last_success_at"]),
         p50_body_len=int(d["p50_body_len"]) if d["p50_body_len"] is not None else None,
     )
@@ -388,6 +390,7 @@ class Frontier(ABC):
         etag: str | None = None,
         last_modified: str | None = None,
         needs_browser: bool | None = None,
+        access: str | None = None,
         p50_body_len: int | None = None,
     ) -> None:
         """Release a lease and schedule the next visit.
@@ -440,6 +443,13 @@ class Frontier(ABC):
                 sets[key] = value
         if needs_browser is not None:
             sets["needs_browser"] = 1 if needs_browser else 0
+            sets["needs_browser_at"] = to_ts(now)
+        # What refused us, not merely that something did. Stamped with the same
+        # clock as needs_browser so a verdict can go stale: sites remove
+        # challenges, and a permanent verdict would never notice - the lesson
+        # `feed_absent` already paid for.
+        if access is not None:
+            sets["access"] = access
             sets["needs_browser_at"] = to_ts(now)
 
         assignments = ", ".join(
@@ -524,7 +534,7 @@ class Frontier(ABC):
         return self._execute(
             "SELECT t.a_id, t.domain, t.newsroom_url, t.enabled, "
             "       t.discovery_method, t.last_success_at, t.consec_failures, "
-            "       t.p50_body_len, d.needs_browser, "
+            "       t.p50_body_len, d.needs_browser, d.access, "
             "       t.feed_url, t.feed_absent, t.probed_at, t.etag, "
             "       t.last_modified, d.next_allowed_at, d.crawl_delay_s, "
             "       d.revisit_period_s "
@@ -633,6 +643,7 @@ CREATE TABLE IF NOT EXISTS domain_state (
   last_modified     TEXT,
   needs_browser     INTEGER NOT NULL DEFAULT 0,
   needs_browser_at  TEXT,
+  access            TEXT,
   last_success_at   TEXT,
   p50_body_len      INTEGER
 );
@@ -673,6 +684,13 @@ class SQLiteFrontier(Frontier):
 
     def create_schema(self) -> None:
         self.conn.executescript(_SQLITE_DDL)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        have = {r[1] for r in self.conn.execute("PRAGMA table_info(domain_state)")}
+        for column, ddl in _SQLITE_MIGRATIONS:
+            if column not in have:
+                self.conn.execute(ddl)
 
     def _execute(self, sql: str, params: Sequence[Any] = ()) -> list[tuple]:
         return self.conn.execute(sql, tuple(params)).fetchall()
@@ -731,6 +749,20 @@ class SQLiteFrontier(Frontier):
 # MySQL - production
 # ---------------------------------------------------------------------------
 
+# `create_schema` is CREATE TABLE IF NOT EXISTS, so a table already out there
+# never gains a column. The frontier had no migration path at all, which was
+# survivable only while its schema never changed - adding `access` to a live
+# 1,747-domain database without this makes every `SELECT _COLUMN_LIST` fail
+# with "no such column". Same rule `status.py` and `sink.py` already follow:
+# anything added after the first deployment goes in BOTH the DDL and here.
+_SQLITE_MIGRATIONS = (
+    ("access", "ALTER TABLE domain_state ADD COLUMN access TEXT"),
+)
+_MYSQL_MIGRATIONS = (
+    ("access", "ALTER TABLE domain_state ADD COLUMN access VARCHAR(16) NULL"),
+)
+
+
 _MYSQL_DDL = """
 CREATE TABLE IF NOT EXISTS domain_state (
   domain            VARCHAR(255) NOT NULL,
@@ -750,6 +782,7 @@ CREATE TABLE IF NOT EXISTS domain_state (
   last_modified     VARCHAR(255) NULL,
   needs_browser     TINYINT(1) NOT NULL DEFAULT 0,
   needs_browser_at  DATETIME NULL,
+  access            VARCHAR(16) NULL,
   last_success_at   DATETIME NULL,
   p50_body_len      INT NULL,
   PRIMARY KEY (domain),
@@ -795,6 +828,11 @@ class MySQLFrontier(Frontier):
         with self.conn.cursor() as cur:
             cur.execute(_MYSQL_DDL)
             cur.execute(_MYSQL_TARGET_DDL)
+            cur.execute("SHOW COLUMNS FROM domain_state")
+            have = {row[0] for row in (cur.fetchall() or [])}
+            for column, ddl in _MYSQL_MIGRATIONS:
+                if column not in have:
+                    cur.execute(ddl)
 
     def _execute(self, sql: str, params: Sequence[Any] = ()) -> list[tuple]:
         with self.conn.cursor() as cur:

@@ -250,6 +250,11 @@ Those are sites declining an identified crawler, which is their call. The bar
 is that every remaining line is a true statement about the site rather than a
 defect on our side.
 
+**That last sentence turned out to be doing more work than expected.** Scoring
+the full corpus found 149 unreachable targets, and the majority were *not*
+sites declining anything — they were our own defects wearing the same error
+line. See *Who is actually refusing us* below.
+
 Final corpus over those ten runs: **322 unique articles from 77 domains**,
 median `prose_ratio` **0.848** with none below 0.30, median body 3,520
 characters, and **zero** rows missing a date or a headline.
@@ -274,7 +279,7 @@ fixes.
 
 | Source | What it did | Fix |
 |---|---|---|
-| **RSS** | Path-probing looks for a feed at the *site root*. It found the organisation-wide `/rss.xml`, whose newest items are advocacy actions, events and legislative summaries | A feed the page **declares** is authoritative. A **probed root** feed must corroborate: at least one of its items has to be linked from the target page. Zero overlap across a whole feed means it covers a different part of the site |
+| **RSS** | Path-probing looks for a feed at the *site root*. It found the organisation-wide `/rss.xml`, whose newest items are advocacy actions, events and legislative summaries | A **probed root** feed must corroborate: at least one of its items has to be linked from the target page. Zero overlap across a whole feed means it covers a different part of the site. A **declared** feed was originally trusted outright — see *The declaration hole* below, which is why it no longer is |
 | **Sitemap** | No section match, so `refs = in_section or refs` widened to the entire site: `/what-we-do/…`, `/policy-resources/…` | An unscoped sitemap is now marked as such and held in reserve. The target's own listing page — an explicit statement of what belongs in this section — outranks it |
 | **Listing harvest** | Hard-filtered to the section, so it found **zero** links and could not rescue the situation | Section first, then fall back to links **outside** `<nav>`/`<header>`/`<footer>`/`<aside>` |
 
@@ -307,6 +312,74 @@ feed on a **sectioned** target (a free check — it reads the URL, fetches
 nothing), and `scrapev3 reset` now clears the cached source, conditional-GET
 state and feed-absence verdict, so a reset really does mean "pretend we never
 crawled this."
+
+### The declaration hole, and two more found by scoring the whole corpus
+
+The rule above was right and the cascade stated it; what it did not do was
+*reach* it. Scoring all 1,747 audited targets at once
+(`data/audits/full-corpus.jsonl`) found three places the corroboration step was
+skipped rather than failed — none of which raised anything, all of which
+produce the `fightcancer.org` shape.
+
+**1. A declared feed bypassed corroboration entirely — 64 targets.** The
+original rule read "a feed the page declares is authoritative", which is true
+about *ownership* and says nothing about *scope*. WordPress emits
+`<link rel="alternate" href="/feed">` into the head of **every page it
+renders**, so a press room declares the site-wide feed exactly as readily as
+the blog does — and the guard built to stop this failure was bypassed on
+precisely the sites most likely to cause it.
+
+| Target | Declared feed | What it returned |
+|---|---|---|
+| `cleanpower.org/news` | `/feed` | `/blog/…` |
+| `pen.org/press-releases` | `/feed` | essays |
+| `cei.org/news_releases` | `/feed` | undated blog posts |
+| `leasefoundation.org/news/press-releases` | `/feed` | staff biographies |
+
+All 64 had **≥20 same-site links** on the page, so the thin-page escape never
+fired; `declared` was the only way through. The declaration is now honoured
+only while the feed is *at least as specific as the section it was declared
+on*: `/news/feed` on `/news` still wins outright, `/feed` on
+`/news/press-releases` corroborates like any probed root feed. That is not a
+rejection, only a demand for evidence — a feed that really is the section's
+has its items linked from the section's own page. Measured after: all four
+above now resolve to the correct source (`cleanpower.org` → `/news/…`,
+`cei.org` → `/news_releases/…`, `cresenergy.com` → `/press-releases/…`).
+
+**2. The sitemap rung counted furniture as yield.** A sitemap lists every URL
+the CMS knows, not every article: `sanjac.edu`'s carries
+`/about/news/_nav.ounav` and `/about/news/index.php`,
+`news.columbusstate.edu`'s carries `/_banner.inc` and `/categories.php`. Every
+one sits under the correct section prefix, so scoping kept them, and
+`crawl_target` then discarded them — *after* discovery had already counted
+them as yield, satisfied `usable()`, won the cascade and cached "sitemap
+works". That is the `empty` health state arriving by a different road. The
+crawl's own gate now runs inside discovery, where the decision is actually
+made. News-sitemap entries are exempt for the reason feeds are: `<news:news>`
+is the publisher asserting this is an article, and URL shape does not overrule
+it. `sanjac.edu` now returns ten real releases instead of five includes.
+
+**3. The reserve sitemap — tried, measured, reverted.** 22 targets win from
+the reserve with zero overlap and store the wrong document (`bny.com` yields
+fund factsheets, `nature.org` Spanish programme pages, `uvahealth.com`
+clinician profiles), so making the reserve corroborate looks like the same
+fix. It is not. Every one of those newsrooms is **JS-rendered**: the listing
+HTML holds chrome and nothing else, so overlap is zero whether the sitemap is
+right or wrong. Measured article-shaped links on the live pages — 4 on
+`nyclu.org`, 7 on `americanrivers.org`, 10 on `nature.org`, all of them
+chrome. Corroborating the reserve dropped `nyclu.org`, whose unscoped sitemap
+is **right** (`/press-release/…` under a `/press` target), at the same rate as
+`bny.com`, whose is wrong. The URL classifier cannot separate them either — it
+scores both as articles. Telling them apart needs evidence discovery does not
+have, so those 22 belong in per-domain data, not in the cascade. The revert is
+pinned by a test, so the next reader does not re-derive it the hard way.
+
+**What this says about the audit.** `no_overlap` is a *signal*, not a verdict:
+of 110 sitemap targets carrying it, only the 22 unscoped ones are wrong. The
+other 88 are correctly scoped sitemaps returning archive pages that have
+simply scrolled off page one of the listing — `aba.com`, `unisq.edu.au` and
+`utsouthwestern.edu` all read as broken and are fine. Acting on the finding
+without reading the sample would have "fixed" 88 working sites.
 
 **And the listing page needed a fast path of its own.** Once a target settles
 on `listing`, that page is the cheapest source there is — one request, and the
@@ -660,6 +733,133 @@ step by hand drift exactly like two definitions of "healthy" would, and the
 first pair here disagreed about which columns existed within a day. It opens on
 six columns, has a toggle for the cascade detail, and shows every field in the
 payload when a row is clicked.
+
+## Who is actually refusing us
+
+149 of 1,747 audited targets were unreachable, and the working assumption was
+that they were bot walls needing a browser. Only 41 carried any explanation.
+The other 108 were not mysterious — **`audit.py` recorded `resp.wall` and had
+no branch at all for `resp.error`**, so `DNSError`, `robots-disallow` and
+`circuit-open` were dropped on the floor and every one of them landed on the
+website as `status = 0`, scored as the publisher's site being down.
+
+Fixing that one missing `else` reordered the whole problem:
+
+| Cluster | n | What it actually was | Browser? |
+|---|---|---|---|
+| `status = 0` | 67 | **Our own resolver.** All 20 `.mil` hosts failed `getaddrinfo` locally while `1.1.1.1` answered instantly | No |
+| `403` | 55 | **The User-Agent string** | No |
+| genuine JS challenge | 41 | Cloudflare / Akamai / Imperva interstitials | Yes |
+| `404` | 19 | Stale `newsroom_url` values — an intake problem | No |
+
+**`status = 0` meant four unrelated things** — a transport exception, an open
+circuit breaker, a robots refusal, and a `Response` nobody filled in — and
+nothing downstream could tell them apart. `failure_kind()` is now a closed
+vocabulary over exactly that, for the same reason `severity` is closed: it ends
+up on a website nobody has redeployed. A `robots` refusal is no longer a
+finding at all, and `dns` is scored against *us*.
+
+**We were reporting 20 defence agencies as broken sites because of a resolver
+fault on one laptop.** `scrapev3 doctor` now answers that in two seconds, and
+`SCRAPEV3_DOH_URL` is the escape hatch when the host's resolver cannot be
+fixed. With it set, `www.darpa.mil` returns 200 and 40KB of press releases.
+(DoH rather than `CURLOPT_DNS_SERVERS`, which needs a libcurl built against
+c-ares — the wheel curl_cffi ships is not, and fails with `Failed to setopt
+10211`.)
+
+### The 403s are about who we say we are
+
+Holding the TLS fingerprint and every other header constant, and changing only
+the User-Agent:
+
+| Sent | `defense.gov` | `weforum.org` | `michigan.gov` |
+|---|---|---|---|
+| `TNSNewsBot/1.0 (+…)` | **403** | **403** | **403** |
+| `Chrome/131.0.0.0` | 200 | 200 | 200 |
+| `Chrome/131… TNSNewsBot/1.0 (+…)` | **403** | **403** | **403** |
+
+So these WAFs match on the *presence of a bot token*, not on anything we did —
+and appending our identity to a browser string is not a middle path, it is just
+a 403. Meanwhile robots.txt on every one of them returns `can_fetch = True` for
+us with no `Crawl-delay`. **The publisher's own stated policy permits the crawl
+and a CDN default overrides it.**
+
+The shape of the fix matters more than the fix:
+
+- **We still lead with the honest UA on every host.** The browser string is a
+  repair path tried *once*, only after a 403 or a wall, then remembered per
+  domain — a refusing host costs one extra request per run, not one per URL.
+- **`From: crawler@targetednews.com` is sent under both identities**, so a
+  publisher reading their logs can still find out who we are and tell us to
+  stop. The removal list that answers them is already built.
+- **`robots_agent` is new, and it is the whole safety property.**
+  `Protego.can_fetch` keys entirely on the string it is handed, so pointing it
+  at a User-Agent we now sometimes change would have silently swapped which
+  robots group applies to us — loosening the rules we obey as a side effect of
+  a header. robots.txt is evaluated against `TNSNewsBot` no matter what we
+  send. `tests/test_identity.py` pins it.
+- **Leading with the honest UA is also what keeps Cloudflare's Verified Bot
+  programme reachable**, which `fetch/robots.py` was written against. It needs
+  a stable identifiable UA; a crawler that presents as Chrome everywhere
+  forfeits it permanently.
+
+**One retraction.** An early probe showed `chrome124` timing out on
+`defense.gov` where `chrome131` returned 200, and that read as a stale-pin
+failure. It does not reproduce — `chrome124` now returns 200 there too. The pin
+was still 26 releases behind, and `impersonate` is bumped and now *tested*
+against the installed `curl_cffi` rather than trusted to a comment saying
+"re-pinned quarterly". But `defense.gov` is not evidence for it.
+
+**What this does not change:** a genuine challenge page is still a site
+declining an identified crawler.
+
+### What was actually left: eight
+
+All 149 previously-unreachable targets were re-audited afterwards
+(`data/audits/reaudit-unreachable.jsonl`). **76 of 148 became reachable**, and
+40 went straight from `broken` to `ok`. `.mil` went from **0 of 20** to **18 of
+20**, and DNS failures went to **zero**.
+
+The 72 still unreachable are the interesting half, because for the first time
+they say why:
+
+| kind | n | whose problem |
+|---|---|---|
+| `robots` | 27 | **Nobody's.** robots.txt disallows it and we obeyed. These were being scored as broken sites |
+| `http_4xx` | 18 | Dead newsroom URLs — an intake problem, not a crawl one |
+| `tls` | 8 | Expired or untrusted certificate chains |
+| `wall` | **8** | Genuine bot walls |
+| `http2` | 7 | `HTTP/2 stream reset by server` — the protocol, not the site |
+| `http_5xx`, `connect` | 4 | Transient |
+
+**Eight.** That is the real bot-wall number, against an original impression of
+149 and a working assumption of 41. Four of the eight are flat `access denied`
+refusals that a browser renders identically; four are interstitials
+(`nfib.com`, `cii.in`, `abi.org.uk`, `qorvo.com`). Twenty-seven "failures" were
+robots.txt working exactly as intended.
+
+Two classes only became visible once the reasons stopped being discarded:
+`CertificateVerifyError` (curl_cffi's name for a bad chain — it does not start
+with `SSLError`, so it fell into the catch-all) and the HTTP/2 stream resets,
+which also settle the open question about ALPN: the client **is** negotiating
+h2. Retrying those seven on HTTP/1.1 is the obvious next move.
+
+### The browser tier
+
+Off by default (`SCRAPEV3_BROWSER=off`), and pointed at `js_rendered` sites
+rather than at walls — newsrooms that never refused us and simply do not put
+their articles in the HTML. `extract.cascade.needs_browser` already detected
+those per article and the verdict was counted and thrown away; it now becomes a
+per-domain `access` verdict. Challenge hosts need a second, separate switch,
+because pointing a browser at a challenge is a decision that should be dated
+rather than inherited from a default.
+
+It renders inside `PoliteFetcher._paced`, the same context manager the HTTP
+path uses, so it takes the global semaphore, the per-host lock, the full
+delay with jitter and the per-IP cap. In production the render is the *second*
+request of a pair, so a rendered page is strictly more paced than a fetched
+one. robots.txt is checked above it in `_get_once` and is not reachable by any
+other route — `tests/test_browser_tier.py` pins that one specifically.
 
 ## Politeness
 

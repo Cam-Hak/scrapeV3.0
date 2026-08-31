@@ -25,6 +25,11 @@ MAX_BACKOFF_EXPONENT = 6
 
 # How long a 'this site has no feed' verdict is trusted before re-probing.
 FEED_ABSENCE_TTL_DAYS = 30
+# Sites remove challenges and CDNs get reconfigured, so an access verdict is
+# only worth trusting for a while. Exactly the lesson `feed_absent` paid for:
+# a permanent verdict would blacklist a site that fixed itself and nothing
+# would ever notice.
+ACCESS_VERDICT_TTL_DAYS = 30
 
 
 def utcnow() -> datetime:
@@ -102,8 +107,21 @@ class DomainRecord:
     last_modified: str | None = None
     needs_browser: bool = False
     needs_browser_at: datetime | None = None
+    # `challenge` | `refused` | `unresolved`, or None if nothing refused us.
+    # A closed vocabulary - see `fetch.HostVerdict`.
+    access: str | None = None
     last_success_at: datetime | None = None
     p50_body_len: int | None = None
+    def access_verdict_is_fresh(
+            self, ttl_days: int = ACCESS_VERDICT_TTL_DAYS) -> bool:
+        """Trust a recorded refusal only while it is recent.
+
+        Stamped on `needs_browser_at`, which existed and was read by nothing.
+        """
+        if not self.access or self.needs_browser_at is None:
+            return False
+        return (utcnow() - self.needs_browser_at) < timedelta(days=ttl_days)
+
     # Populated by Frontier.acquire(); every newsroom URL on this domain.
     targets: list[Target] = field(default_factory=list)
 

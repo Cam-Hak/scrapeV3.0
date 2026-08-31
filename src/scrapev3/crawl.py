@@ -61,6 +61,10 @@ class CrawlStats:
     # discovered, 36 stored and zero in every rejection row looks broken, and
     # the honest answer was "the rest were older than --max-age-days".
     too_old: int = 0
+    # Sources that answered 304. Counted because an armed run and an unarmed
+    # run both reporting `discovered: 0` must not look identical - the same
+    # argument `too_old` already makes.
+    not_modified: int = 0
     # Agencies purged this pass because the shared removal list named them.
     removed_agencies: int = 0
     # Targets seeded this pass because the shared request list named them.
@@ -115,11 +119,22 @@ async def crawl_target(
     max_age_days: int,
     stats: CrawlStats,
     tns: "TnsSink | None" = None,
-) -> tuple[str, str | None, bool]:
-    """Crawl one newsroom URL. Returns (method, source_url, feed_absent)."""
+    known_etag: str | None = None,
+    known_last_modified: str | None = None,
+) -> tuple[str, str | None, bool, "Discovery"]:
+    """Crawl one newsroom URL. Returns (method, source_url, feed_absent, found)."""
     found = await discover(fetcher, newsroom_url,
                            known_feed=known_feed, known_method=known_method,
-                           feed_absent=feed_absent, limit=max_articles * 3)
+                           feed_absent=feed_absent,
+                           known_etag=known_etag,
+                           known_last_modified=known_last_modified,
+                           limit=max_articles * 3)
+    # Nothing has changed since we last looked. The cheapest possible outcome,
+    # and emphatically not a failure - see `Discovery.not_modified`.
+    if found.not_modified:
+        stats.not_modified += 1
+        log.debug("%s unchanged since last run (304)", tag(domain))
+        return known_method or found.method, known_feed, feed_absent, found
     stats.bump(stats.by_method, found.method)
     stats.discovered += len(found.articles)
     for err in found.errors:
@@ -141,6 +156,10 @@ async def crawl_target(
     publisher = found.target_domain or domain
 
     cutoff = datetime.utcnow() - timedelta(days=max_age_days)
+    # How many of this target's articles came back as JS shells. A majority is
+    # the signal that a browser would genuinely help here.
+    extracted_here = 0
+    js_shells = 0
     stored_here = 0
     stale_streak = 0
     seed = canonical_url(newsroom_url)
@@ -203,8 +222,10 @@ async def crawl_target(
         if article is None:
             continue        # _extract_ref has already classified and counted it
 
+        extracted_here += 1
         if article.quality.get("needs_browser"):
             stats.needs_browser += 1
+            js_shells += 1
         reason = article.unusable_reason
         if reason is not None:
             stats.unusable += 1
@@ -239,12 +260,22 @@ async def crawl_target(
             if tns is not None:
                 load_to_tns(tns, sink, article, a_id=a_id, stats=stats)
 
-    return found.method, found.feed_url, found.feed_absent
+    # A clear majority of shells, on a site that never refused us, is
+    # `js_rendered`: fixable by rendering, with no arms race involved.
+    if extracted_here >= 3 and js_shells / extracted_here > 0.6:
+        found.js_rendered = True
+    return found.method, found.feed_url, found.feed_absent, found
 
 
 # What each TnsSink outcome means for whether the article should be offered
 # again. Only "error" is retryable; a rejection is a verdict, not a hiccup.
 _RETRYABLE = "insert_error"
+
+# Above this share of a pass's hostnames failing to resolve, the fault is ours
+# rather than the publishers'. Deliberately not 100%: a handful of genuinely
+# dead hosts is normal in a 50k corpus, and waiting for every single one to
+# fail would never fire.
+_RESOLVER_ALARM = 0.25
 
 
 def load_to_tns(tns: "TnsSink", sink: Sink, article: Article, *, a_id: int,
@@ -503,11 +534,20 @@ async def crawl_once(
 
         sem = asyncio.Semaphore(concurrency)
 
-        async with PoliteFetcher(settings) as fetcher:
+        # What each leased domain did to us LAST time, so the browser tier can
+        # be pointed only at hosts that have already earned it. Built here
+        # because the frontier is in hand here; the fetcher never reads it, and
+        # a stale verdict is ignored - sites remove challenges, and a permanent
+        # verdict would never notice.
+        escalate = {r.domain: r.access for r in leased
+                    if r.access and r.access_verdict_is_fresh()}
+
+        async with PoliteFetcher(settings, escalate=escalate) as fetcher:
 
             async def one_domain(record) -> None:
                 async with sem:
                     method, feed_url, feed_absent = "none", None, False
+                    js_rendered = False
                     ok = False
                     try:
                         # Every target on this domain, under the one lease -
@@ -518,7 +558,8 @@ async def crawl_once(
                             targets = [t for t in targets if t.a_id == only_a_id]
                         for target in targets:
                             stats.targets += 1
-                            method, feed_url, feed_absent = await crawl_target(
+                            (method, feed_url, feed_absent,
+                             found) = await crawl_target(
                                 fetcher, sink,
                                 domain=record.domain,
                                 a_id=target.a_id,
@@ -531,29 +572,70 @@ async def crawl_once(
                                 max_age_days=max_age_days,
                                 stats=stats,
                                 tns=tns,
+                                known_etag=target.etag,
+                                known_last_modified=target.last_modified,
                             )
+                            # A 304 is a reached origin, so it counts as
+                            # success. Without this the politest possible
+                            # outcome would drive the failure counter and the
+                            # website would report a quiet publisher as broken.
+                            js_rendered = js_rendered or found.js_rendered
+                            reached = method != "none" or found.not_modified
                             frontier.release_target(
                                 target.newsroom_url,
-                                success=method != "none",
+                                success=reached,
                                 discovery_method=method if method != "none" else None,
                                 feed_url=feed_url,
+                                etag=found.etag,
+                                last_modified=found.last_modified,
                                 # Only write the verdict when we actually probed.
                                 feed_absent=True if feed_absent else None,
                             )
-                            ok = ok or method != "none"
+                            ok = ok or reached
                     except Exception as exc:                   # noqa: BLE001
                         stats.errors.append(f"{record.domain}: {type(exc).__name__}: {exc}")
                     finally:
+                        # What refused us, remembered. The in-process counter
+                        # dies with the fetcher and the frontier's own counter
+                        # never learned WHY, so `needs_browser` sat wired all
+                        # the way through the status table to the website with
+                        # nothing writing it. `challenge` is the only verdict a
+                        # browser could help with - of 41 walls in the first
+                        # corpus run, 30 were flat denials that render exactly
+                        # the same in Chrome, and claiming those "need a
+                        # browser" would be a false statement on 30 rows.
+                        verdict = fetcher.host_verdict(record.domain)
+                        # A site that never refused us but serves JS shells is
+                        # `js_rendered`, and that is the only verdict here a
+                        # browser fixes without any arms race. A refusal always
+                        # outranks it: it is the harder fact about the host.
+                        access = verdict.access if verdict else None
+                        if access is None and js_rendered:
+                            access = "js_rendered"
                         frontier.release(
                             record.domain,
                             success=ok,
                             discovery_method=method if method != "none" else None,
                             feed_url=feed_url,
+                            access=access,
+                            needs_browser=(access in ("challenge", "js_rendered")
+                                           if access else None),
                         )
                         if progress is not None:
                             progress(record.domain)
 
             await asyncio.gather(*(one_domain(r) for r in leased))
+
+            # One loud line about our own resolver, rather than one quiet
+            # "site unreachable" per publisher. A resolver broken for a whole
+            # TLD reported 20 .mil agencies as failing sites through a full
+            # corpus run, and nothing in the output pointed at the resolver.
+            attempted, failed = fetcher.resolver_report()
+            if attempted and failed / attempted > _RESOLVER_ALARM:
+                stats.errors.append(
+                    f"local DNS resolver failed for {failed} of {attempted} "
+                    f"hostnames - these are not site failures. Check the "
+                    f"resolver, or set SCRAPEV3_DOH_URL")
     finally:
         # In `finally`, not after the gather, so it also runs on the two paths
         # that skip the crawl body: nothing due to lease, and an exception. The

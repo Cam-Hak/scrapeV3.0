@@ -31,7 +31,8 @@ from selectolax.lexbor import LexborHTMLParser
 
 from ..fetch import PoliteFetcher
 from ..tracing import get as _get_logger, slug, tag
-from ..urls import canonical_url, classify_url, registrable_domain
+from ..urls import (canonical_url, classify_url, is_non_news_path,
+                    registrable_domain)
 
 log = _get_logger(__name__)
 
@@ -98,6 +99,24 @@ class Discovery:
     # own-content guard as `usable()` and has to judge against the same
     # identity, or discovery accepts articles the crawl then throws away.
     target_domain: str | None = None
+    # The source answered 304: nothing has changed since we last looked. NOT a
+    # failure, and the distinction is load-bearing - `Response.ok` is false for
+    # a 304, so without this a quiet publisher would be released with
+    # success=False, the failure counter would climb, and three days later the
+    # website would tell them their site was failing because nothing had
+    # happened on it.
+    not_modified: bool = False
+    # Validators from the winning source, stored on the target so the next run
+    # can ask "has this changed?" instead of re-downloading it.
+    etag: str | None = None
+    last_modified: str | None = None
+    # Set by the crawl, not by discovery: most of this target's articles came
+    # back as JavaScript shells with no body. That is the honest case for a
+    # browser - a rendering problem on a site that never refused us - as
+    # opposed to a challenge, which is a site declining an identified crawler.
+    # `extract.cascade.needs_browser` already computed this per article and
+    # the verdict was counted and thrown away.
+    js_rendered: bool = False
 
 
 def _origin(url: str) -> str:
@@ -375,6 +394,24 @@ async def from_sitemap(
             if not resp.ok:
                 continue
             children, refs = parse_sitemap(resp.text)
+            # A sitemap lists every URL the CMS knows about, not every article:
+            # nav includes, banner fragments and section indexes sit in it
+            # beside the press releases, all under the right section prefix.
+            # sanjac.edu's carries /about/news/_nav.ounav and
+            # /about/news/index.php; news.columbusstate.edu's carries
+            # /_banner.inc and /categories.php. `crawl_target` already discards
+            # them, but only after discovery has counted them as yield - which
+            # is what lets a sitemap holding nothing but furniture satisfy
+            # `usable()`, win the cascade and cache as the method. Same gate,
+            # applied where the decision is actually made.
+            #
+            # News sitemaps are exempt for the reason feeds are: a
+            # <news:news> entry is the publisher stating this is an article,
+            # so URL shape does not get to overrule it.
+            refs = [r for r in refs
+                    if r.source == "news_sitemap"
+                    or (not is_non_news_path(r.url)
+                        and classify_url(r.url).is_article)]
             if section:
                 in_section = [r for r in refs
                               if urlsplit(r.url).path.lower().startswith(section)]
@@ -578,6 +615,31 @@ def _root_feed_for_section(feed_url: str, section: str | None) -> bool:
     return len([p for p in urlsplit(feed_url).path.split("/") if p]) <= 1
 
 
+def _declaration_is_scoped(feed_url: str, section: str | None) -> bool:
+    """Does a declared feed speak for the target's section, or for the site?
+
+    A `<link rel="alternate">` proves the publisher owns the feed. It does not
+    prove the feed is about the page it was declared on, and WordPress emits
+    the site-wide `/feed` into the head of EVERY page it renders - so a press
+    room declares it exactly as readily as the blog does. Trusting the
+    declaration outright therefore hands the whole-site feed a free pass on
+    precisely the sites most likely to be wrong: cleanpower.org/news declares
+    /feed and gets /blog/... , pen.org/press-releases declares /feed and gets
+    essays, leasefoundation.org/news/press-releases declares /feed and gets
+    staff biographies. 64 of 1,747 audited targets took this path and
+    collected the wrong documents while reporting success.
+
+    So the declaration is honoured only when the feed is at least as specific
+    as the section it was declared on. Anything shallower is a site-wide
+    source and corroborates like a probed one - which is not a rejection, only
+    a demand for evidence: a feed that really is this section's will have its
+    items linked from the section's own page.
+    """
+    if not section:
+        return True
+    return urlsplit(feed_url).path.lower().rstrip("/").startswith(section)
+
+
 def _covers_target(found: Discovery, listing_html: str | None,
                         newsroom_url: str, section: str | None,
                         declared: bool, base_url: str | None = None) -> bool:
@@ -637,6 +699,8 @@ async def discover(
     known_feed: str | None = None,
     known_method: str | None = None,
     feed_absent: bool = False,
+    known_etag: str | None = None,
+    known_last_modified: str | None = None,
     limit: int = 50,
 ) -> Discovery:
     """Find recent articles for one newsroom URL.
@@ -774,8 +838,19 @@ async def discover(
         # it is the request the full cascade would open with anyway. Without
         # this branch a listing target re-walked the sitemap index on every
         # single run, having already established the sitemap does not cover it.
-        resp = await fetcher.get(newsroom_url)
+        # Conditional GET, armed only on the fast path: this is the request
+        # we make every single run against a page that usually has not
+        # changed. Article fetches are deliberately NOT armed - `seen_url`
+        # already stops us refetching those, and a 304 there would yield an
+        # empty body that extraction would turn into a blank article.
+        resp = await fetcher.get(newsroom_url, etag=known_etag,
+                                 last_modified=known_last_modified)
         listing_fetched = True
+        if resp.from_cache:
+            log.debug("%s listing unchanged (304)", tag(target_domain))
+            return Discovery(method="listing", feed_url=None,
+                             not_modified=True, target_domain=target_domain,
+                             etag=known_etag, last_modified=known_last_modified)
         if resp.ok:
             listing_html = resp.text
             listing_url = resp.final_url or newsroom_url
@@ -784,6 +859,8 @@ async def discover(
                                        limit=limit, section=section,
                                        base_url=listing_url)
             if usable(found):
+                found.etag = resp.headers.get("etag")
+                found.last_modified = resp.headers.get("last-modified")
                 return found
         elif resp.wall:
             out = Discovery(method="none")
@@ -865,8 +942,11 @@ async def discover(
     if feed_url:
         found = await from_feed(fetcher, feed_url)
         log.debug("%s   feed %d items", tag(target_domain), len(found.articles))
+        # `declared` is honoured only while the declaration is about this
+        # section; a site-wide feed corroborates however it was found.
+        trusted = declared and _declaration_is_scoped(feed_url, section)
         if usable(found) and _covers_target(
-                found, listing_html, seed, section, declared,
+                found, listing_html, seed, section, trusted,
                 base_url=listing_url):
             log.debug("%s won rss, %d articles", tag(target_domain),
                       len(found.articles))
@@ -912,6 +992,22 @@ async def discover(
                       len(found.articles))
             return found
 
+    # The reserve is deliberately NOT corroborated, which is a measured
+    # decision and not an oversight. 22 of 1,747 audited targets win from here
+    # with zero overlap and store the wrong document - bny.com's newsroom
+    # yields fund factsheets, nature.org's yields Spanish programme pages,
+    # uvahealth.com's yields clinician profiles - so requiring overlap looks
+    # like the obvious fix. It was tried and reverted: every one of these
+    # newsrooms is JS-rendered, so the listing HTML holds no article links to
+    # corroborate against, and the check cannot tell a wrong source from an
+    # unobservable one. Measured on the pages themselves, article-shaped links
+    # number 4 (nyclu.org), 7 (americanrivers.org) and 10 (nature.org), and
+    # every one of those is chrome rather than an article. Corroborating here
+    # dropped nyclu.org, whose unscoped sitemap was RIGHT, at the same rate as
+    # bny.com, whose was wrong.
+    #
+    # Telling those two apart needs evidence this stage does not have, so the
+    # 22 belong in per-domain data rather than in the cascade.
     if unscoped_sitemap is not None:
         unscoped_sitemap.feed_absent = probed_empty
         unscoped_sitemap.notes.extend(probe_notes)

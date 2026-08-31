@@ -1,0 +1,437 @@
+[
+  {
+    "domain": "centerforfoodsafety.org",
+    "a_id": 24481,
+    "newsroom_urls": [
+      "https://www.centerforfoodsafety.org/press-releases"
+    ],
+    "discovery_method": [
+      "listing"
+    ],
+    "source_url": [
+      null
+    ],
+    "stored": [
+      {
+        "url": "https://www.centerforfoodsafety.org/press-releases/7147/lawsuit-filed-to-stop-pollution-from-industrial-shellfish-aquaculture-hatchery",
+        "headline": "Center for Food Safety | Press Releases |  | Lawsuit Filed to Stop Pollution from Industrial Shellfish Aquaculture Hatchery",
+        "published_at": "2026-08-04T00:00:00",
+        "body_len": 3554
+      },
+      {
+        "url": "https://www.centerforfoodsafety.org/press-releases/7146/federal-court-sides-with-the-publics-right-to-know-in-gmobioengineered-food-labeling-case",
+        "headline": "Center for Food Safety | Press Releases |  | Federal Court Sides with the Public's Right to Know in GMO/Bioengineered Food Label",
+        "published_at": "2026-08-04T00:00:00",
+        "body_len": 7682
+      },
+      {
+        "url": "https://centerforfoodsafety.org/press-releases/7147/lawsuit-filed-to-stop-pollution-from-industrial-shellfish-aquaculture-hatchery",
+        "headline": "Lawsuit Filed to Stop Pollution from Industrial Shellfish Aquaculture Hatchery",
+        "published_at": "2026-08-04T00:00:00",
+        "body_len": 3554
+      },
+      {
+        "url": "https://centerforfoodsafety.org/press-releases/7146/federal-court-sides-with-the-publics-right-to-know-in-gmobioengineered-food-labeling-case",
+        "headline": "Federal Court Sides with the Public's Right to Know in GMO/Bioengineered Food Label",
+        "published_at": "2026-08-04T00:00:00",
+        "body_len": 7682
+      }
+    ]
+  },
+  {
+    "domain": "espnpressroom.com",
+    "a_id": 30335,
+    "newsroom_urls": [
+      "https://espnpressroom.com/us/press-releases"
+    ],
+    "discovery_method": [
+      null
+    ],
+    "source_url": [
+      null
+    ],
+    "stored": [
+      {
+        "url": "https://espnpressroom.com/2026-27-espn-college-football-commentators-schedule",
+        "headline": "2026-27 ESPN College Football Commentators Schedule",
+        "published_at": "2026-08-17T16:43:24",
+        "body_len": 1192
+      }
+    ]
+  },
+  {
+    "domain": "falmouth.ac.uk",
+    "a_id": 18089,
+    "newsroom_urls": [
+      "https://www.falmouth.ac.uk/news"
+    ],
+    "discovery_method": [
+      null
+    ],
+    "source_url": [
+      null
+    ],
+    "stored": [
+      {
+        "url": "http://www.falmouth.ac.uk/news/rewriting-story-metal",
+        "headline": "Rewriting the Story of Metal",
+        "published_at": "2026-08-25T12:50:23",
+        "body_len": 5729
+      },
+      {
+        "url": "http://www.falmouth.ac.uk/news/esports-graduate-secures-placement-global-car-brand",
+        "headline": "Esports graduate secures placement with global car brand",
+        "published_at": "2026-08-25T07:46:27",
+        "body_len": 2547
+      },
+      {
+        "url": "http://www.falmouth.ac.uk/news/visual-effects-alumnus-discusses-being-honoured-academy-award",
+        "headline": "Visual Effects alumnus discusses being honoured with Academy Award",
+        "published_at": "2026-08-20T15:35:57",
+        "body_len": 3734
+      },
+      {
+        "url": "http://www.falmouth.ac.uk/student-voice/why-i-chose-study-bahons-illustration-online",
+        "headline": "Why I chose to study BA(Hons) Illustration (Online)",
+        "published_at": "2026-08-20T12:23:32",
+        "body_len": 3434
+      }
+    ]
+  },
+  {
+    "domain": "logistics.org.uk",
+    "a_id": 19293,
+    "newsroom_urls": [
+      "https://logistics.org.uk/media/press-releases"
+    ],
+    "discovery_method": [
+      null
+    ],
+    "source_url": [
+      null
+    ],
+    "stored": [
+      {
+        "url": "https://logistics.org.uk/blog/logistics-sector-showing-green-shoots-of-recovery-says-logistics-uk",
+        "headline": "Logistics sector showing \u201cgreen shoots of recovery\u201d, says Logistics UK",
+        "published_at": "2026-08-25T08:33:20",
+        "body_len": 5317
+      },
+      {
+        "url": "https://logistics.org.uk/blog/logistics-uk-announces-finalists-in-2026-logistics-awards",
+        "headline": "Logistics UK announces finalists in 2026 Logistics Awards",
+        "published_at": "2026-08-21T09:49:53",
+        "body_len": 6472
+      },
+      {
+        "url": "https://logistics.org.uk/blog/apprenticeships-offer-cheat-code-for-successful-career",
+        "headline": "Apprenticeships offer \u201ccheat code\u201d for successful career, says Logistics UK",
+        "published_at": "2026-08-20T13:01:03",
+        "body_len": 4316
+      },
+      {
+        "url": "https://logistics.org.uk/blog/logistics-ensures-bbc-proms-perform-in-perfect-harmony",
+        "headline": "Logistics ensures BBC Proms perform in perfect harmony",
+        "published_at": "2026-08-18T15:00:07",
+        "body_len": 4411
+      }
+    ]
+  },
+  {
+    "domain": "tamu.edu",
+    "a_id": 3908,
+    "newsroom_urls": [
+      "https://agrilifetoday.tamu.edu/category/all-news"
+    ],
+    "discovery_method": [
+      "cms_api"
+    ],
+    "source_url": [
+      "https://agrilifetoday.tamu.edu/wp-json/wp/v2/posts?per_page=9&orderby=date&order=desc&_fields=id,link,date_gmt,modified_gmt,title,content,excerpt"
+    ],
+    "stored": [
+      {
+        "url": "https://agrilifetoday.tamu.edu/2026/08/26/texas-am-agrilife-lab-renamed-to-reflect-broader-ranch-wildlife-focus",
+        "headline": "Texas A&M AgriLife lab renamed to reflect broader ranch, wildlife focus",
+        "published_at": "2026-08-26T19:37:55",
+        "body_len": 3139
+      },
+      {
+        "url": "https://agrilifetoday.tamu.edu/2026/08/26/mock-accidents-real-lessons-inside-occupational-safety-management-class",
+        "headline": "Mock accidents, real lessons: Inside Occupational Safety Management class",
+        "published_at": "2026-08-26T19:00:39",
+        "body_len": 4633
+      },
+      {
+        "url": "https://agrilifetoday.tamu.edu/2026/08/25/hunting-outlook-good-hunters-encouraged-to-report-signs-of-new-world-screwworm",
+        "headline": "Hunting outlook good, hunters encouraged to report signs of New World screwworm",
+        "published_at": "2026-08-25T22:40:27",
+        "body_len": 20283
+      },
+      {
+        "url": "https://agrilifetoday.tamu.edu/2026/08/25/new-faculty-experts-aim-to-improve-animal-nutrition-and-meat-systems",
+        "headline": "New faculty experts aim to improve animal nutrition and meat systems",
+        "published_at": "2026-08-25T20:12:27",
+        "body_len": 3561
+      },
+      {
+        "url": "https://agrilifetoday.tamu.edu/2026/08/24/she-studied-why-people-trust-now-comes-the-test",
+        "headline": "She studied why people trust, now comes the test",
+        "published_at": "2026-08-24T20:14:40",
+        "body_len": 7439
+      },
+      {
+        "url": "https://agrilifetoday.tamu.edu/2026/08/24/brun-named-director-of-texas-am-agrilife-genomics-and-bioinformatics-service",
+        "headline": "Brun named director of Texas A&M AgriLife Genomics and Bioinformatics Service",
+        "published_at": "2026-08-24T17:23:17",
+        "body_len": 2550
+      },
+      {
+        "url": "https://agrilifetoday.tamu.edu/2026/08/24/research-explores-new-markets-for-prickly-pear-cactus",
+        "headline": "Research explores new markets for prickly pear cactus",
+        "published_at": "2026-08-24T14:36:31",
+        "body_len": 6261
+      }
+    ]
+  },
+  {
+    "domain": "ticas.org",
+    "a_id": 25299,
+    "newsroom_urls": [
+      "https://ticas.org/type/press-release-statement"
+    ],
+    "discovery_method": [
+      "cms_api"
+    ],
+    "source_url": [
+      "https://ticas.org/wp-json/wp/v2/posts?per_page=12&orderby=date&order=desc&_fields=id,link,date_gmt,modified_gmt,title,content,excerpt"
+    ],
+    "stored": [
+      {
+        "url": "https://ticas.org/anti-poverty/medicaid-work-requirements-brief",
+        "headline": "New Medicaid Work Requirements: How Policymakers Can Mitigate Coverage Losses for Students",
+        "published_at": "2026-08-05T15:39:16",
+        "body_len": 730
+      },
+      {
+        "url": "https://ticas.org/new-york/cuny-basic-needs-support-blog",
+        "headline": "Building on CUNY\u2019s Success: Meeting Students\u2019 Basic Needs in Changing Times",
+        "published_at": "2026-07-30T12:11:55",
+        "body_len": 9795
+      }
+    ]
+  },
+  {
+    "domain": "uc.edu",
+    "a_id": 24738,
+    "newsroom_urls": [
+      "https://www.uc.edu/news/colleges/blueash.html"
+    ],
+    "discovery_method": [
+      null
+    ],
+    "source_url": [
+      null
+    ],
+    "stored": [
+      {
+        "url": "https://www.uc.edu/news/articles/2026/08/n21426621.html",
+        "headline": "DAAP students turn design skills into robotic solutions",
+        "published_at": "2026-08-26T00:00:00",
+        "body_len": 11723
+      },
+      {
+        "url": "https://www.uc.edu/news/articles/2026/08/n21424742.html",
+        "headline": "DAAP appoints Joseph Heathcott as new associate dean for research",
+        "published_at": "2026-08-17T00:00:00",
+        "body_len": 3930
+      }
+    ]
+  },
+  {
+    "domain": "usc.edu",
+    "a_id": 7932,
+    "newsroom_urls": [
+      "https://keck.usc.edu/news/category/press-release"
+    ],
+    "discovery_method": [
+      null
+    ],
+    "source_url": [
+      null
+    ],
+    "stored": [
+      {
+        "url": "https://viterbischool.usc.edu/news/2026/08/usc-students-are-developing-a-forecasting-system-to-improve-hospital-operations",
+        "headline": "USC students are developing a forecasting system to improve hospital operations",
+        "published_at": "2026-08-17T07:09:50",
+        "body_len": 5416
+      }
+    ]
+  },
+  {
+    "domain": "usc.edu",
+    "a_id": 27091,
+    "newsroom_urls": [
+      "https://viterbischool.usc.edu/news"
+    ],
+    "discovery_method": [
+      null
+    ],
+    "source_url": [
+      null
+    ],
+    "stored": [
+      {
+        "url": "https://viterbischool.usc.edu/news/2026/08/what-if-we-asked-a-different-question",
+        "headline": "What If We Asked a Different Question?",
+        "published_at": "2026-08-25T16:48:00",
+        "body_len": 4108
+      },
+      {
+        "url": "https://viterbischool.usc.edu/news/2026/08/unlocking-the-physics-of-turbulence-with-ai",
+        "headline": "Unlocking the Physics of Turbulence with AI",
+        "published_at": "2026-08-24T18:53:37",
+        "body_len": 4853
+      },
+      {
+        "url": "https://viterbischool.usc.edu/news/2026/08/usc-computer-scientist-answers-five-common-questions-about-ai",
+        "headline": "USC Computer Scientist Answers Five Common Questions About AI",
+        "published_at": "2026-08-21T17:08:15",
+        "body_len": 6561
+      },
+      {
+        "url": "https://viterbischool.usc.edu/news/2026/08/how-to-see-eye-to-eye-with-ai",
+        "headline": "How to See Eye to Eye With AI",
+        "published_at": "2026-08-20T16:00:24",
+        "body_len": 5386
+      }
+    ]
+  },
+  {
+    "domain": "usc.edu",
+    "a_id": 38873,
+    "newsroom_urls": [
+      "https://rossier.usc.edu/news-insights/news?type=154"
+    ],
+    "discovery_method": [
+      null
+    ],
+    "source_url": [
+      null
+    ],
+    "stored": [
+      {
+        "url": "https://rossier.usc.edu/news/usc-edtech-accelerator-named-one-of-americas-best-incubators-accelerators-for-2026-by-time-magazine",
+        "headline": "USC EdTech Accelerator named one of America\u2019s Best Incubators & Accelerators for 2026 by TIME Magazine",
+        "published_at": "2026-08-18T16:35:44",
+        "body_len": 2263
+      },
+      {
+        "url": "https://rossier.usc.edu/news/usc-pullias-center-for-higher-education-announces-new-leadership",
+        "headline": "USC Pullias Center for Higher Education announces new leadership",
+        "published_at": "2026-08-17T15:35:29",
+        "body_len": 6663
+      },
+      {
+        "url": "https://rossier.usc.edu/news/authenticating-intelligence-a-conversation-with-stephen-aguilar",
+        "headline": "Authenticating Intelligence: A Conversation with Stephen Aguilar",
+        "published_at": "2026-08-12T22:41:47",
+        "body_len": 4359
+      },
+      {
+        "url": "https://rossier.usc.edu/news/royel-johnson-named-incoming-editor-of-ashes-the-review-of-higher-education",
+        "headline": "Royel Johnson named incoming editor of ASHE\u2019s The Review of Higher Education",
+        "published_at": "2026-08-05T15:59:16",
+        "body_len": 3807
+      }
+    ]
+  },
+  {
+    "domain": "utmb.edu",
+    "a_id": 20593,
+    "newsroom_urls": [
+      "https://www.utmb.edu/news/article/-in-category/categories/utmb-institutional-news/news-releases"
+    ],
+    "discovery_method": [
+      null
+    ],
+    "source_url": [
+      null
+    ],
+    "stored": [
+      {
+        "url": "https://www.utmb.edu/news/article/utmb-news/2026/08/21/utmb-secures-record--10.3-million-to-expand-wic-services-across-southeast-texas",
+        "headline": "UTMB secures record $10.3 million to expand WIC services across Southeast Texas",
+        "published_at": "2026-08-21T10:04:00",
+        "body_len": 4357
+      },
+      {
+        "url": "https://www.utmb.edu/news/article/utmb-news/2026/08/18/utmb-school-of-nursing-launches-new-maternal-health-digital-badge-program",
+        "headline": "UTMB School of Nursing launches new maternal health digital badge program",
+        "published_at": "2026-08-18T11:40:00",
+        "body_len": 9406
+      }
+    ]
+  },
+  {
+    "domain": "worldbank.org",
+    "a_id": 15674,
+    "newsroom_urls": [
+      "https://www.worldbank.org/en/news/all?displayconttype_exact=Press+Release&lang_exact=English&qterm="
+    ],
+    "discovery_method": [
+      "sitemap"
+    ],
+    "source_url": [
+      "https://www.worldbank.org/content/vdam/sitemap/www-worldbank-org-Subnational/sitemap-www-worldbank-org-others-api-1.xml"
+    ],
+    "stored": [
+      {
+        "url": "https://www.worldbank.org/pt/news/press-release/2026/07/brazil-world-bank-group-backs-fiscal-reform-sustainable-urban-growth-fortaleza",
+        "headline": "Banco Mundial apoia reforma fiscal e crescimento urbano sustent\u00e1vel para ampliar oportunidades em Fortaleza",
+        "published_at": "2026-07-31T00:00:00",
+        "body_len": 2723
+      },
+      {
+        "url": "https://www.worldbank.org/en/news/press-release/2026/07/31/wbg-support-to-help-philippines-expand-resilient-water-and-sanitation-services",
+        "headline": "World Bank Group Support to Help Philippines Expand Resilient Water and Sanitation Services for Water Security and Jobs",
+        "published_at": "2026-07-31T00:00:00",
+        "body_len": 3219
+      },
+      {
+        "url": "https://www.worldbank.org/en/news/press-release/2026/07/31/world-bank-appoints-lisa-finneran-as-vice-president-for-partnerships-innovation-an",
+        "headline": "World Bank Appoints Lisa Finneran as Vice President for Partnerships, Innovation and Mobilization",
+        "published_at": "2026-07-31T00:00:00",
+        "body_len": 2559
+      },
+      {
+        "url": "https://www.worldbank.org/en/news/press-release/2026/07/31/brazil-world-bank-group-backs-fiscal-reform-sustainable-urban-growth-fortaleza",
+        "headline": "World Bank Group Backs Fiscal Reform and Sustainable Urban Growth to Expand Opportunities in Fortaleza, Brazil",
+        "published_at": "2026-07-31T00:00:00",
+        "body_len": 3070
+      }
+    ]
+  },
+  {
+    "domain": "wttc.org",
+    "a_id": 26207,
+    "newsroom_urls": [
+      "https://wttc.org/about/news/press-releases"
+    ],
+    "discovery_method": [
+      null
+    ],
+    "source_url": [
+      null
+    ],
+    "stored": [
+      {
+        "url": "https://wttc.org/news/hoteles-de-costa-rica-podran-implementar-los-conceptos-basicos-de-sostenibilidad-hotelera-de-wttc",
+        "headline": "Hoteles de costa rica podr\u00e1n implementar los conceptos b\u00e1sicos de sostenibilidad hotelera de WTTC",
+        "published_at": "2026-08-26T00:00:00",
+        "body_len": 4467
+      }
+    ]
+  }
+]
