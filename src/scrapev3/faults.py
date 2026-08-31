@@ -34,10 +34,136 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .fetch import FAILURE_KINDS, owner_of, severity_of
+from .extract.models import UNUSABLE_CODES
+from .fetch import ACCESS_VERDICTS, FAILURE_KINDS, NOT_FAILURES
 from .tracing import get as _get_logger
 
 log = _get_logger(__name__)
+
+# Every stage's vocabulary, judged in one place. `fetch` names what it saw and
+# stops there - it has no business knowing what `extract_no_date` costs - so the
+# severity and owner maps live here, beside the ranking that consumes them.
+#
+# Fetch kinds are bare words (`dns`, `tls`) because `failure_kind` produces them
+# and that contract predates this module. Everything else is stage-prefixed, so
+# a `--kind` filter reads as what it is and the two can never collide.
+DISCOVER_KINDS = ("discover_failed",)
+
+# The crawl's own machinery, not a publisher's. All `us` by definition: nothing
+# here is a statement about a site.
+ADMIN_KINDS = ("admin_target_crashed", "admin_list_unreachable",
+               "admin_list_failed", "admin_status_unpublished",
+               "admin_faults_unrecorded", "admin_resolver_failing")
+
+# How bad it is, on `audit.Finding`'s scale rather than a fourth one:
+# 3 broken, 2 suspicious, 1 worth a look.
+#
+# `robots` and `wall` are 1 because nothing is broken - the rule worked, or the
+# publisher said no. They are still recorded, because "27 targets refused" is
+# worth knowing; they are simply not defects.
+_SEVERITY = {
+    # fetch
+    "dns": 3, "circuit": 3, "error": 3,
+    "tls": 2, "http2": 2, "http_4xx": 2, "connect": 2, "timeout": 2,
+    "http_5xx": 2,
+    "wall": 1, "robots": 1,
+    # discovery: the cascade found nothing at all. The biggest bucket in the
+    # corpus - 2,074 agencies have never been crawled successfully - and until
+    # now it was free text printed eight at a time.
+    "discover_failed": 3,
+    # extraction, keyed by the codes `extract.models` pairs with its own
+    # reasons, so the two cannot drift.
+    "extract_body_is_chrome": 3,   # we read the wrong subtree: ours
+    "extract_no_headline": 2,
+    "extract_body_too_short": 2,
+    "extract_no_date": 2,
+    # the crawl's own machinery
+    "admin_target_crashed": 3,
+    "admin_list_failed": 3,
+    "admin_status_unpublished": 3,
+    "admin_faults_unrecorded": 3,
+    "admin_list_unreachable": 2,
+    "admin_resolver_failing": 3,
+}
+
+# Whose problem this is. This is the "whose problem" column of the re-audit
+# table in README, in code, so it can be ranked on rather than read.
+#
+#   us      our defect or our data. Fixable, and the count should trend to
+#           zero. This is the only bucket that is a to-do list.
+#   site    the publisher's server, certificate or markup. A better crawler
+#           might cope; it will never be zero.
+#   policy  they declined an identified crawler on purpose. Counted and
+#           attributed in full, and never ranked - see `_OWNER_WEIGHT`.
+_OWNER = {
+    "robots": "policy",   # robots.txt disallowed it and we obeyed. 27 of 149
+    "wall": "policy",     # a genuine bot wall. 8 left after the identity fix
+    "dns": "us",          # our resolver: 20 .mil targets that 1.1.1.1 answered
+    "circuit": "us",      # our own breaker, opened on our own thresholds
+    "http2": "us",        # our impersonation profile negotiates h2. 7 targets
+    "http_4xx": "us",     # dead newsroom_url values - an intake problem
+    "error": "us",        # an exception class we have not mapped yet
+    "tls": "site",        # expired or untrusted chain. 8 targets
+    "connect": "site",
+    "timeout": "site",
+    "http_5xx": "site",
+    # A cascade that found nothing is usually the site having no machine
+    # readable source, which is what the cascade exists to cope with - but it
+    # is also how our own corroboration bugs present. `site`, and the sample
+    # detail is what tells the two apart.
+    "discover_failed": "site",
+    # The one extraction failure that is ours: the body extractor read the nav
+    # menu. That is the silent-quality bug this whole project exists to
+    # eliminate, so it does not get to be the publisher's fault.
+    "extract_body_is_chrome": "us",
+    "extract_no_headline": "site",
+    "extract_body_too_short": "site",
+    "extract_no_date": "site",
+}
+_OWNER.update({k: "us" for k in ADMIN_KINDS})
+
+# The access verdicts, judged the same way. Consistent with the severities
+# `status._SEVERITY` already gives the health words they produce: `refused` is
+# `warn` (their call), `unresolved` is `error` (ours).
+_ACCESS_OWNER = {
+    "refused": "policy",
+    "challenge": "policy",
+    "unresolved": "us",
+    "js_rendered": "site",
+}
+
+# Everything that can reach the store, for the totality test.
+ALL_KINDS = (tuple(k for k in FAILURE_KINDS if k not in NOT_FAILURES)
+             + DISCOVER_KINDS + UNUSABLE_CODES + ADMIN_KINDS)
+
+
+def severity_of(kind: str) -> int:
+    """How bad a failure kind is. Unknown kinds are treated as broken.
+
+    Loud rather than quiet, for the reason `status.severity_of` resolves an
+    unknown health word to `warn`: a kind that reaches this function without
+    being classified is a gap in our own map, and a gap must not read as fine.
+
+    `ok` and `not_modified` score 0 instead. They are known-good, not unknown,
+    so the safe direction for them is the bottom of the list rather than the
+    top - a successful fetch ranked as broken would be worse than not ranking
+    it at all.
+    """
+    if kind in NOT_FAILURES:
+        return 0
+    return _SEVERITY.get(kind, 3)
+
+
+def owner_of(kind: str) -> str:
+    """Whose problem a failure kind is: `us`, `site` or `policy`.
+
+    Unknown kinds are `us` for the same reason - an unmapped word is our
+    omission, so it belongs on our list until someone says otherwise. Accepts
+    access verdicts too, so a caller holding either vocabulary can ask.
+    """
+    if kind in _ACCESS_OWNER:
+        return _ACCESS_OWNER[kind]
+    return _OWNER.get(kind, "us")
 
 # `us` outranks `site` at equal breadth because a defect we can fix should come
 # before a site oddity that may have no fix at all. `policy` is zero, not small:

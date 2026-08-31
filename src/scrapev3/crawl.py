@@ -179,6 +179,14 @@ async def crawl_target(
     stats.discovered += len(found.articles)
     for err in found.errors:
         stats.errors.append(f"{domain}: {err}")
+        # One bucket rather than eight, on purpose. The cascade has eight ways
+        # to end at `method="none"` and telling them apart means mapping error
+        # prose to codes - a fourth vocabulary that drifts the first time a
+        # message is reworded. The domain, the count and the sample sentence are
+        # what make it actionable, and they are exact.
+        if domain:
+            stats.record_fault("discover_failed", domain, a_id=a_id,
+                               url=newsroom_url, detail=err)
     for note in found.notes:
         stats.notes.append(f"{domain}: {note}")
 
@@ -270,6 +278,9 @@ async def crawl_target(
         if reason is not None:
             stats.unusable += 1
             stats.bump(stats.by_unusable, reason)
+            if domain:
+                stats.record_fault(article.unusable_code, domain, a_id=a_id,
+                                   url=article.url, detail=reason)
             stats.unusable_domains.setdefault(reason, set()).add(domain)
             log.debug("%s   - %-14s %s", tag(domain), reason[:14], slug(ref.url))
             continue
@@ -316,6 +327,12 @@ _RETRYABLE = "insert_error"
 # dead hosts is normal in a 50k corpus, and waiting for every single one to
 # fail would never fire.
 _RESOLVER_ALARM = 0.25
+
+# Faults in our own machinery are not about a publisher, so they are filed
+# under one pseudo-domain rather than blamed on whichever site was in flight.
+# It keeps `--domain` honest and stops an unreachable removal list from making
+# a working publisher look broken.
+_CRAWLER = "(crawler)"
 
 
 def load_to_tns(tns: "TnsSink", sink: Sink, article: Article, *, a_id: int,
@@ -456,6 +473,8 @@ def _apply_removals(settings: Settings, frontier: Frontier, sink: Sink,
         conn = removal.connect(settings)
     except Exception as exc:                                # noqa: BLE001
         stats.errors.append(f"removal list unreachable: {type(exc).__name__}: {exc}")
+        stats.record_fault("admin_list_unreachable", _CRAWLER,
+                           detail=f"removal list unreachable: {type(exc).__name__}: {exc}")
         return 0
     try:
         removal.ensure_table(conn)
@@ -463,6 +482,8 @@ def _apply_removals(settings: Settings, frontier: Frontier, sink: Sink,
                                     sink=sink, tns=tns)
     except Exception as exc:                                # noqa: BLE001
         stats.errors.append(f"removal list failed: {type(exc).__name__}: {exc}")
+        stats.record_fault("admin_list_failed", _CRAWLER,
+                           detail=f"removal list failed: {type(exc).__name__}: {exc}")
         return 0
     finally:
         conn.close()
@@ -487,6 +508,8 @@ def _apply_requests(settings: Settings, frontier: Frontier,
         conn = site_requests.connect(settings)
     except Exception as exc:                                # noqa: BLE001
         stats.errors.append(f"request list unreachable: {type(exc).__name__}: {exc}")
+        stats.record_fault("admin_list_unreachable", _CRAWLER,
+                           detail=f"request list unreachable: {type(exc).__name__}: {exc}")
         return 0, 0
     try:
         site_requests.ensure_table(conn)
@@ -496,6 +519,8 @@ def _apply_requests(settings: Settings, frontier: Frontier,
                                          removed=removal.listed(conn))
     except Exception as exc:                                # noqa: BLE001
         stats.errors.append(f"request list failed: {type(exc).__name__}: {exc}")
+        stats.record_fault("admin_list_failed", _CRAWLER,
+                           detail=f"request list failed: {type(exc).__name__}: {exc}")
         return 0, 0
     finally:
         conn.close()
@@ -556,6 +581,8 @@ def _publish_status(settings: Settings, frontier: Frontier, sink: Sink,
         conn = status_mod.connect(settings)
     except Exception as exc:                                # noqa: BLE001
         stats.errors.append(f"status not published: {type(exc).__name__}: {exc}")
+        stats.record_fault("admin_status_unpublished", _CRAWLER,
+                           detail=f"status not published: {type(exc).__name__}: {exc}")
         return 0
     try:
         status_mod.ensure_table(conn)
@@ -564,6 +591,8 @@ def _publish_status(settings: Settings, frontier: Frontier, sink: Sink,
         return written
     except Exception as exc:                                # noqa: BLE001
         stats.errors.append(f"status not published: {type(exc).__name__}: {exc}")
+        stats.record_fault("admin_status_unpublished", _CRAWLER,
+                           detail=f"status not published: {type(exc).__name__}: {exc}")
         return 0
     finally:
         conn.close()
@@ -688,6 +717,14 @@ async def crawl_once(
                             ok = ok or reached
                     except Exception as exc:                   # noqa: BLE001
                         stats.errors.append(f"{record.domain}: {type(exc).__name__}: {exc}")
+                        # The one that must never be silent. Everything else
+                        # here is a classified failure; this is the crawl
+                        # raising where nothing anticipated it, and it used to
+                        # be one of eight strings truncated to 110 characters.
+                        stats.record_fault("admin_target_crashed", record.domain,
+                                           a_id=record.a_id,
+                                           url=record.newsroom_url,
+                                           detail=f"{type(exc).__name__}: {exc}")
                     finally:
                         # What refused us, remembered. The in-process counter
                         # dies with the fetcher and the frontier's own counter
@@ -726,6 +763,9 @@ async def crawl_once(
             # corpus run, and nothing in the output pointed at the resolver.
             attempted, failed = fetcher.resolver_report()
             if attempted and failed / attempted > _RESOLVER_ALARM:
+                stats.record_fault("admin_resolver_failing", _CRAWLER,
+                                   n=failed,
+                                   detail=f"{failed} of {attempted} hostnames")
                 stats.errors.append(
                     f"local DNS resolver failed for {failed} of {attempted} "
                     f"hostnames - these are not site failures. Check the "

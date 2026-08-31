@@ -894,6 +894,17 @@ reads to the bottom.
 | `http2`, `http_4xx` | **us** | our impersonation profile; our own stale `newsroom_url` values |
 | `tls`, `connect`, `timeout`, `http_5xx` | site | their certificate, their server |
 | `robots`, `wall` | policy | they declined an identified crawler |
+| `discover_failed` | site | the cascade found nothing at all |
+| `extract_body_is_chrome` | **us** | the body extractor read the nav menu |
+| `extract_no_headline`, `extract_no_date`, `extract_body_too_short` | site | the page did not carry it |
+| `admin_*` | **us** | our own machinery: a crash, an unreachable list, a resolver failing |
+
+Every stage records, not only the fetch. A discovery cascade that ends at
+`method="none"` is one bucket rather than eight — telling the eight apart means
+mapping error prose to codes, which is a vocabulary that drifts the first time a
+message is reworded, and the domain, the count and the sample sentence are exact.
+The crawler's own faults are filed under a `(crawler)` pseudo-domain so an
+unreachable removal list cannot make a working publisher look broken.
 
 Faults land in `data/faults.sqlite`, aggregated per `(run, kind, domain)` with
 one sample URL and message each — roughly 600 rows a run rather than the

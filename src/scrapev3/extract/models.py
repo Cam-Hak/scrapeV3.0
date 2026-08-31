@@ -47,6 +47,20 @@ class DateResult:
     disagreement_days: int | None = None
 
 
+# The four ways an article fails to be storable, each paired with the sentence
+# a person reads. One tuple rather than two lists, so a phrase reworded for
+# clarity cannot silently start a new bucket in the fault store.
+_UNUSABLE = (
+    ("extract_no_headline",     "no headline"),
+    ("extract_body_too_short",  "body under 300 chars"),
+    ("extract_no_date",         "no date"),
+    ("extract_body_is_chrome",  "body looks like page chrome"),
+)
+
+#: Just the codes, for `faults` to classify without importing the pairing.
+UNUSABLE_CODES = tuple(code for code, _ in _UNUSABLE)
+
+
 @dataclass
 class Article:
     url: str
@@ -85,12 +99,28 @@ class Article:
         and completely different problems - the first is a date-extraction gap,
         the second is extraction reading the wrong subtree.
         """
+        index = self._unusable_index()
+        return None if index is None else _UNUSABLE[index][1]
+
+    @property
+    def unusable_code(self) -> str | None:
+        """The same verdict as a stable key, for `faults`.
+
+        The phrase is what a person reads and the code is what gets counted
+        across runs, so a reworded phrase must not silently start a new bucket.
+        Both come from `_UNUSABLE`, one branch chain, so they cannot drift.
+        """
+        index = self._unusable_index()
+        return None if index is None else _UNUSABLE[index][0]
+
+    def _unusable_index(self) -> int | None:
+        """Which requirement failed, by position. Ordered cheapest first."""
         if not self.headline:
-            return "no headline"
+            return 0
         if self.body_len < 300:
-            return "body under 300 chars"
+            return 1
         if self.date.value is None:
-            return "no date"
+            return 2
         if self.quality.get("looks_like_navigation", False):
-            return "body looks like page chrome"
+            return 3
         return None

@@ -23,8 +23,9 @@ import re
 import pytest
 
 from scrapev3 import faults
+from scrapev3.faults import owner_of, severity_of
 from scrapev3.fetch import (ACCESS_VERDICTS, FAILURE_KINDS, NOT_FAILURES,
-                            failure_kind, owner_of, severity_of)
+                            failure_kind)
 from scrapev3.fetch.client import Response
 
 
@@ -74,14 +75,27 @@ class TestTheConstantMatchesTheFunction:
 
 class TestEveryKindHasASeverityAndAnOwner:
 
-    @pytest.mark.parametrize("kind", [k for k in FAILURE_KINDS
-                                      if k not in NOT_FAILURES])
+    @pytest.mark.parametrize("kind", faults.ALL_KINDS)
     def test_a_failure_is_classified(self, kind):
-        # The totality check. Catches a kind added to the vocabulary without a
+        # The totality check, over every stage that can reach the store - not
+        # just the fetch words. Catches a kind added to the vocabulary without a
         # severity or an owner, which would otherwise take the unknown default
         # and quietly claim to be our most urgent problem.
         assert severity_of(kind) in (1, 2, 3)
         assert owner_of(kind) in ("us", "site", "policy")
+
+    def test_every_stage_can_be_recorded(self):
+        # The coverage this module is for: a crawl fails in five places and
+        # only one of them used to survive the run.
+        prefixes = {k.split("_")[0] for k in faults.ALL_KINDS}
+        assert {"discover", "extract", "admin"} <= prefixes
+        assert "dns" in faults.ALL_KINDS, "the fetch words are bare, not prefixed"
+
+    def test_the_crawlers_own_faults_are_never_blamed_on_a_publisher(self):
+        # They are filed under one pseudo-domain, so an unreachable removal
+        # list cannot make a working site look broken.
+        for kind in faults.ADMIN_KINDS:
+            assert owner_of(kind) == "us"
 
     @pytest.mark.parametrize("kind", NOT_FAILURES)
     def test_a_success_scores_zero_not_broken(self, kind):
@@ -303,6 +317,53 @@ class TestAFailedFetchReachesTheStore:
         assert stats.by_failure == {"connect": 2}
         assert list(stats.faults) == [("connect", "x.mil")]
         assert stats.faults[("connect", "x.mil")][0] == 2
+
+
+class TestTheCodeAndThePhraseCannotDrift:
+    """`unusable_reason` is what a person reads; `unusable_code` is what gets
+    counted across runs. Rewording the sentence for clarity must not silently
+    start a new bucket, so both come out of one branch chain."""
+
+    def test_every_reason_has_a_code_and_every_code_is_classified(self):
+        from scrapev3.extract.models import _UNUSABLE, UNUSABLE_CODES
+
+        assert len(_UNUSABLE) == 4
+        assert UNUSABLE_CODES == tuple(c for c, _ in _UNUSABLE)
+        for code, phrase in _UNUSABLE:
+            assert code.startswith("extract_"), code
+            assert phrase and phrase[0].islower(), phrase
+            assert severity_of(code) in (1, 2, 3)
+
+    def test_they_are_produced_by_the_same_branch(self):
+        # Not two lists checked in parallel: one index, two views. A caller
+        # cannot get a code that disagrees with the reason beside it.
+        from datetime import datetime
+
+        from scrapev3.extract.models import _UNUSABLE, Article, DateResult
+
+        article = Article(url="https://x.org/a", headline="A real headline",
+                          body="x" * 400,
+                          date=DateResult(value=datetime(2026, 8, 1)),
+                          quality={"looks_like_navigation": True})
+        assert article.unusable_reason == _UNUSABLE[3][1]
+        assert article.unusable_code == _UNUSABLE[3][0]
+
+    def test_a_storable_article_has_neither(self):
+        from datetime import datetime
+
+        from scrapev3.extract.models import Article, DateResult
+
+        article = Article(url="https://x.org/a", headline="A real headline",
+                          body="x" * 400,
+                          date=DateResult(value=datetime(2026, 8, 1)))
+        assert article.unusable_reason is None
+        assert article.unusable_code is None
+
+    def test_the_nav_menu_bug_is_ours_not_the_publishers(self):
+        # The silent-quality failure this whole project exists to eliminate.
+        # Filing it under `site` would put it below a certificate expiry.
+        assert owner_of("extract_body_is_chrome") == "us"
+        assert owner_of("extract_no_date") == "site"
 
 
 class TestTheRollUp:

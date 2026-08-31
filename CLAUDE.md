@@ -160,7 +160,13 @@ feed/wp-json bodies are `FEED`/`CMS_API`, not `TRAFILATURA`.
   Unknown kinds fail loud (severity 3, owner `us`) because an unmapped word is
   our omission; `ok`/`not_modified` score 0 because they are known-good rather
   than unknown; an unranked *band* fails quiet, because a list whose top item
-  is noise stops being read. `by_failure` is keyed on the kind, never on
+  is noise stops being read. **Every stage records**, not just the fetch: a
+  discovery cascade that found nothing, an article that failed extraction, the
+  per-domain catch-all, and the crawler's own machinery - the last filed under
+  the `(crawler)` pseudo-domain, so an unreachable removal list cannot make a
+  working publisher look broken. `fetch` names what it saw and stops there; the
+  severity and owner maps live in `faults.py` beside the ranking, because
+  `fetch/client.py` has no business knowing what `extract_no_date` costs. `by_failure` is keyed on the kind, never on
   `resp.error` - that string carries the URL, so it used to fragment one cause
   into one row per article.
 - **`policy` is weighted zero, and that is the whole point of the owner axis.**
